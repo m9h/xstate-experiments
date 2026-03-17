@@ -1,0 +1,17 @@
+{
+  "taskId": "go-nogo",
+  "title": "Pavlovian Go/No-Go",
+  "description": "Measure response inhibition: respond to Go stimuli, withhold to No-Go stimuli.",
+  "numTrials": 100,
+  "parameters": {
+    "goTrialProportion": 0.75,
+    "responseDeadline": 600,
+    "fixationDuration": 500,
+    "feedbackDuration": 500,
+    "stimulusDuration": 1000,
+    "goStimulus": "O",
+    "nogoStimulus": "X"
+  },
+  "instructions": "On each trial, a letter will appear briefly.\n\nIf you see 'O' (Go trial): Press the SPACEBAR as fast as you can.\nIf you see 'X' (No-Go trial): Do NOT press any key.\n\nTry to be both fast and accurate. You have a limited time to respond.",
+  "debrief": "This task measures response inhibition — your ability to stop a pre-planned response. Key metrics:\n\n• Go RT: average reaction time on Go trials\n• Commission errors: pressing on No-Go trials (failure to inhibit)\n• Omission errors: failing to press on Go trials\n\nWidely used in ADHD research and impulse control studies."
+}

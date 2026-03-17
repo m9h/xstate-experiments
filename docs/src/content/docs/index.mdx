@@ -1,0 +1,62 @@
+---
+title: Behavioral experiments as statecharts
+description: jsPsych2 replaces timelines and callbacks with XState v5 statecharts. Define your experiment as a state machine. Test it without a browser. Visualize it in Stately.
+template: splash
+hero:
+  tagline: jsPsych2 replaces timelines and callbacks with XState v5 statecharts. Define your experiment as a state machine. Test it without a browser. Visualize it in Stately.
+  actions:
+    - text: Get Started
+      link: /getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: View Examples
+      link: /examples/bandit/
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## Why statecharts?
+
+Every behavioral experiment follows the same pattern: present a stimulus, wait for a response, evaluate it, record data, decide what comes next. This is a state machine. It has always been a state machine. jsPsych2 makes that explicit.
+
+<CardGrid stagger>
+  <Card title="Statecharts as Specs" icon="document">
+    Your experiment IS a statechart. Every state, every transition, every guard is formally specified. Paste it into Stately's visualizer and see your entire protocol as a diagram. Check for unreachable states and missing transitions before running a single participant.
+  </Card>
+  <Card title="Test Without a Browser" icon="laptop">
+    Send events, assert transitions, verify outputs. The full experiment logic runs headlessly in Vitest. No DOM, no simulated keypresses, no timing hacks. Just events and assertions.
+  </Card>
+  <Card title="Compose with Actors" icon="puzzle">
+    Trial types are invoked actors with typed inputs and outputs. The experiment machine invokes block actors, which invoke trial actors. Mix, match, and nest them hierarchically. Each actor is isolated, testable, and reusable.
+  </Card>
+  <Card title="Adaptive by Default" icon="setting">
+    Guards enable staircases, stopping rules, and conditional branching as first-class transitions. A staircase is a guard on difficulty. A stopping rule is a guard on trial count and accuracy. No external variables, no imperative callbacks.
+  </Card>
+</CardGrid>
+
+## The architecture at a glance
+
+```
+experiment machine
+  |-- instructions
+  |-- blocks (sequential)
+  |     |-- block machine (invoked actor)
+  |           |-- trial machine (invoked actor)
+  |           |     |-- fixation
+  |           |     |-- stimulus (entry: record onset)
+  |           |     |-- response (wait for event)
+  |           |     |-- evaluation (guards: correct? retry?)
+  |           |     +-- feedback
+  |           +-- checkNext (guard: hasMoreTrials)
+  |-- debriefing
+  +-- complete (final state -> full dataset)
+```
+
+Data flows **upward** through actor outputs. Each trial emits structured results when it reaches its final state. Blocks collect trial outputs. The experiment collects block outputs. No global data store, no side-channel mutation.
+
+## Built on XState v5
+
+jsPsych2 uses the full statechart formalism (Harel, 1987) plus the actor model (Hewitt, 1973) as implemented by [XState v5](https://stately.ai/docs/xstate). This gives you hierarchical states, parallel regions, guards, delayed transitions, and actor composition out of the box.
+
+The runtime dependency is `xstate` (~15KB gzipped). Rendering is a separate concern -- subscribe to state changes and render however you want: vanilla DOM, React, Lit web components, or PixiJS for timing-critical paradigms.

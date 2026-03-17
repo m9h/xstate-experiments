@@ -1,0 +1,211 @@
+---
+title: Reversal Learning
+description: A probabilistic reversal learning task with dynamic reward contingencies and reversal detection.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Overview
+
+In probabilistic reversal learning, the participant learns which of two stimuli is more rewarding. After a performance criterion is met, the reward contingencies reverse — the previously good option becomes bad, and vice versa. The participant must detect and adapt to the reversal.
+
+### What this demonstrates
+
+- **Dynamic context updates** — reward probabilities change mid-experiment
+- **Performance-based reversals** — guards trigger contingency switches
+- **Block-level logic** — the reversal machine wraps individual choice trials
+- **Multi-phase experiment** — acquisition, reversal, and (optionally) re-reversal phases
+
+## State diagram
+
+```
+[acquisition] ──guard: criterionMet──> [reversal]
+      |                                    |
+      | invoke trialMachine               | entry: swapContingencies
+      | collect results                   | invoke trialMachine
+      | check criterion                   | collect results
+      |                                    | check criterion
+      |                                    |
+      └── (loop until criterion) ──────────┴── guard: criterionMet ──> [done]
+```
+
+## Machine definition
+
+```ts
+import { setup, assign } from 'xstate';
+
+interface ReversalContext {
+  stimuli: [string, string];
+  rewardProbabilities: [number, number]; // e.g., [0.8, 0.2]
+  phase: 'acquisition' | 'reversal';
+  criterionCorrect: number; // consecutive correct needed for reversal
+  consecutiveCorrect: number;
+  trialsCompleted: number;
+  maxTrials: number;
+  trialResults: Array<{
+    phase: string;
+    chosen: number;
+    reward: boolean;
+    correct: boolean;
+    rt: number;
+  }>;
+  reversalTrialIndex: number | null;
+}
+
+export const reversalLearningMachine = setup({
+  guards: {
+    criterionMet: ({ context }) =>
+      context.consecutiveCorrect >= context.criterionCorrect,
+
+    maxTrialsReached: ({ context }) =>
+      context.trialsCompleted >= context.maxTrials,
+
+    inAcquisition: ({ context }) =>
+      context.phase === 'acquisition',
+
+    inReversal: ({ context }) =>
+      context.phase === 'reversal',
+  },
+  actions: {
+    recordTrialResult: assign(({ context, event }) => {
+      const output = event.output;
+      const betterArm = context.rewardProbabilities[0] > context.rewardProbabilities[1] ? 0 : 1;
+      const correct = output.chosenArm === betterArm;
+
+      return {
+        trialResults: [...context.trialResults, {
+          phase: context.phase,
+          chosen: output.chosenArm,
+          reward: output.reward === 1,
+          correct,
+          rt: output.rt,
+        }],
+        trialsCompleted: context.trialsCompleted + 1,
+        consecutiveCorrect: correct
+          ? context.consecutiveCorrect + 1
+          : 0,
+      };
+    }),
+
+    swapContingencies: assign(({ context }) => ({
+      rewardProbabilities: [
+        context.rewardProbabilities[1],
+        context.rewardProbabilities[0],
+      ] as [number, number],
+      phase: 'reversal' as const,
+      consecutiveCorrect: 0,
+      reversalTrialIndex: context.trialsCompleted,
+    })),
+  },
+}).createMachine({
+  id: 'reversalLearning',
+  initial: 'runTrial',
+  context: ({ input }) => ({
+    stimuli: input.stimuli ?? ['A', 'B'],
+    rewardProbabilities: input.rewardProbabilities ?? [0.8, 0.2],
+    phase: 'acquisition' as const,
+    criterionCorrect: input.criterionCorrect ?? 8,
+    consecutiveCorrect: 0,
+    trialsCompleted: 0,
+    maxTrials: input.maxTrials ?? 200,
+    trialResults: [],
+    reversalTrialIndex: null,
+  }),
+  states: {
+    runTrial: {
+      invoke: {
+        src: 'trialMachine',
+        input: ({ context }) => ({
+          trialIndex: context.trialsCompleted,
+          rewardProbabilities: context.rewardProbabilities,
+          qValues: [0.5, 0.5] as [number, number],
+          alpha: 0.1,
+        }),
+        onDone: {
+          target: 'evaluate',
+          actions: 'recordTrialResult',
+        },
+      },
+    },
+    evaluate: {
+      always: [
+        // Check max trials first (always stops)
+        { target: 'done', guard: 'maxTrialsReached' },
+
+        // In acquisition: criterion met triggers reversal
+        {
+          target: 'triggerReversal',
+          guard: ({ context }) =>
+            context.phase === 'acquisition' &&
+            context.consecutiveCorrect >= context.criterionCorrect,
+        },
+
+        // In reversal: criterion met ends the task
+        {
+          target: 'done',
+          guard: ({ context }) =>
+            context.phase === 'reversal' &&
+            context.consecutiveCorrect >= context.criterionCorrect,
+        },
+
+        // Otherwise: continue
+        { target: 'runTrial' },
+      ],
+    },
+    triggerReversal: {
+      entry: 'swapContingencies',
+      always: 'runTrial',
+    },
+    done: {
+      type: 'final',
+    },
+  },
+  output: ({ context }) => ({
+    phase: context.phase,
+    trialsCompleted: context.trialsCompleted,
+    reversalTrialIndex: context.reversalTrialIndex,
+    trialResults: context.trialResults,
+    finalRewardProbabilities: context.rewardProbabilities,
+  }),
+});
+```
+
+## Key design decisions
+
+**The `triggerReversal` state is explicit.** Instead of hiding the contingency swap inside the `evaluate` state's actions, it gets its own state. This makes the reversal visible in the statechart diagram and loggable in transition history.
+
+**Guards evaluate in priority order.** The `evaluate` state checks:
+1. Max trials (safety stop) — always checked first
+2. Acquisition criterion — triggers reversal
+3. Reversal criterion — ends the task
+4. Default — run another trial
+
+**Phase tracking in context.** The `phase` field lets guards distinguish between acquisition and reversal without counting reversals. For tasks with multiple reversals, you would add a `reversalCount` field and adjust the guards.
+
+## Extending to multiple reversals
+
+To support N reversals, modify the evaluate state:
+
+```ts
+// Replace the reversal criterion guard:
+{
+  target: 'done',
+  guard: ({ context }) =>
+    context.phase === 'reversal' &&
+    context.reversalCount >= context.maxReversals &&
+    context.consecutiveCorrect >= context.criterionCorrect,
+},
+{
+  target: 'triggerReversal',
+  guard: ({ context }) =>
+    context.consecutiveCorrect >= context.criterionCorrect,
+},
+```
+
+Each time `triggerReversal` fires, it swaps the contingencies and increments `reversalCount`. The task ends only when both the reversal count and the criterion are satisfied.
+
+## Links
+
+- [Two-Armed Bandit](/examples/bandit/) — the choice trial machine used in this task
+- [Adaptive Designs guide](/guides/adaptive-designs/) — staircase and stopping rule patterns
+- [Stately Visualizer](https://stately.ai/viz) — paste the machine definition to explore

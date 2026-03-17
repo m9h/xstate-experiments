@@ -1,0 +1,255 @@
+---
+title: Two-Step Task
+description: The Daw et al. (2011) two-step decision task, demonstrating hierarchical actor invocation and multi-stage trial logic.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Overview
+
+The two-step task (Daw et al., 2011) is a widely used paradigm for distinguishing model-based and model-free reinforcement learning. Each trial has two stages:
+
+1. **First stage:** Choose between two stimuli. This determines which second-stage state you enter (with common and rare transitions).
+2. **Second stage:** Choose between two more stimuli. This determines whether you receive a reward.
+
+The key analysis examines how first-stage choices are influenced by reward and transition type. Model-based learners account for the transition structure; model-free learners show a simpler reward effect.
+
+### What this demonstrates
+
+- **Hierarchical states** — a trial machine with two sequential choice stages
+- **Probabilistic transitions** — the transition from stage 1 to stage 2 is stochastic
+- **Multiple invoked stages** — each stage is a sub-state with its own input handling
+- **Complex output** — trial data includes both stages, transition type, and reward
+
+## State diagram
+
+```
+[fixation] ─after 500ms─> [stage1]
+                              |
+                         CHOOSE (arm)
+                              |
+                    ┌─────────┴─────────┐
+                    |                   |
+                70% common          30% rare
+                    |                   |
+                    v                   v
+               [stage2-A]          [stage2-B]
+                    |                   |
+               CHOOSE (arm)        CHOOSE (arm)
+                    |                   |
+                    v                   v
+               [reward]            [reward]
+                    |                   |
+                    │ after 1000ms      │ after 1000ms
+                    v                   v
+                  [iti] ─after 500ms─> [done]
+```
+
+## Machine definition
+
+```ts
+import { setup, assign } from 'xstate';
+
+interface TwoStepContext {
+  // Stage 1
+  stage1Choice: 0 | 1 | null;
+  stage1Rt: number | null;
+  stage1OnsetTime: number | null;
+
+  // Transition
+  transitionType: 'common' | 'rare' | null;
+  secondStageState: 'A' | 'B' | null;
+
+  // Stage 2
+  stage2Choice: 0 | 1 | null;
+  stage2Rt: number | null;
+  stage2OnsetTime: number | null;
+
+  // Reward
+  rewardProbabilities: { A: [number, number]; B: [number, number] };
+  reward: 0 | 1 | null;
+
+  // Config
+  commonTransitionProb: number;
+  trialIndex: number;
+}
+
+export const twoStepTrialMachine = setup({
+  types: {} as {
+    context: TwoStepContext;
+    input: {
+      trialIndex: number;
+      rewardProbabilities: { A: [number, number]; B: [number, number] };
+      commonTransitionProb?: number;
+    };
+    events:
+      | { type: 'CHOOSE'; arm: 0 | 1; timestamp: number }
+    output: {
+      trialIndex: number;
+      stage1Choice: 0 | 1;
+      stage1Rt: number;
+      transitionType: 'common' | 'rare';
+      secondStageState: 'A' | 'B';
+      stage2Choice: 0 | 1;
+      stage2Rt: number;
+      reward: 0 | 1;
+    };
+  },
+  actions: {
+    recordStage1Onset: assign({
+      stage1OnsetTime: () => performance.now(),
+    }),
+    processStage1Choice: assign(({ context, event }) => {
+      const choice = event.arm;
+      const rt = event.timestamp - (context.stage1OnsetTime ?? event.timestamp);
+
+      // Determine transition: choice 0 commonly leads to A, choice 1 to B
+      const isCommon = Math.random() < context.commonTransitionProb;
+      const expectedState = choice === 0 ? 'A' : 'B';
+      const secondStageState = isCommon ? expectedState : (expectedState === 'A' ? 'B' : 'A');
+
+      return {
+        stage1Choice: choice,
+        stage1Rt: rt,
+        transitionType: isCommon ? ('common' as const) : ('rare' as const),
+        secondStageState: secondStageState as 'A' | 'B',
+      };
+    }),
+    recordStage2Onset: assign({
+      stage2OnsetTime: () => performance.now(),
+    }),
+    processStage2Choice: assign(({ context, event }) => {
+      const choice = event.arm;
+      const rt = event.timestamp - (context.stage2OnsetTime ?? event.timestamp);
+      const state = context.secondStageState!;
+      const rewardProb = context.rewardProbabilities[state][choice];
+      const reward: 0 | 1 = Math.random() < rewardProb ? 1 : 0;
+
+      return {
+        stage2Choice: choice,
+        stage2Rt: rt,
+        reward,
+      };
+    }),
+  },
+  guards: {
+    goToStateA: ({ context }) => context.secondStageState === 'A',
+    goToStateB: ({ context }) => context.secondStageState === 'B',
+  },
+}).createMachine({
+  id: 'twoStepTrial',
+  initial: 'fixation',
+  context: ({ input }) => ({
+    stage1Choice: null,
+    stage1Rt: null,
+    stage1OnsetTime: null,
+    transitionType: null,
+    secondStageState: null,
+    stage2Choice: null,
+    stage2Rt: null,
+    stage2OnsetTime: null,
+    rewardProbabilities: input.rewardProbabilities,
+    reward: null,
+    commonTransitionProb: input.commonTransitionProb ?? 0.7,
+    trialIndex: input.trialIndex,
+  }),
+  states: {
+    fixation: {
+      after: { 500: 'stage1' },
+    },
+    stage1: {
+      entry: 'recordStage1Onset',
+      on: {
+        CHOOSE: {
+          target: 'transition',
+          actions: 'processStage1Choice',
+        },
+      },
+    },
+    transition: {
+      // Brief visual transition between stages
+      after: {
+        400: [
+          { target: 'stage2A', guard: 'goToStateA' },
+          { target: 'stage2B', guard: 'goToStateB' },
+        ],
+      },
+    },
+    stage2A: {
+      entry: 'recordStage2Onset',
+      on: {
+        CHOOSE: {
+          target: 'reward',
+          actions: 'processStage2Choice',
+        },
+      },
+    },
+    stage2B: {
+      entry: 'recordStage2Onset',
+      on: {
+        CHOOSE: {
+          target: 'reward',
+          actions: 'processStage2Choice',
+        },
+      },
+    },
+    reward: {
+      after: { 1000: 'iti' },
+    },
+    iti: {
+      after: { 500: 'done' },
+    },
+    done: { type: 'final' },
+  },
+  output: ({ context }) => ({
+    trialIndex: context.trialIndex,
+    stage1Choice: context.stage1Choice!,
+    stage1Rt: context.stage1Rt!,
+    transitionType: context.transitionType!,
+    secondStageState: context.secondStageState!,
+    stage2Choice: context.stage2Choice!,
+    stage2Rt: context.stage2Rt!,
+    reward: context.reward!,
+  }),
+});
+```
+
+## Key design decisions
+
+**Separate stage2A and stage2B states.** Although the logic is identical, having distinct states makes the statechart diagram show the branching structure. The renderer can display different visual stimuli for each state. If you prefer a single stage2 state, you can route based on `context.secondStageState` in the renderer instead.
+
+**Transition as a state.** The brief pause between stages (400ms) is modeled as its own state rather than as a delay in stage1. This lets the renderer show a visual transition (e.g., highlighting the selected stimulus and animating to the second stage).
+
+**Reward probabilities as input.** The four reward probabilities (two options in each of two states) are passed as input, allowing the experiment machine to implement drifting rewards across trials by updating the probabilities based on Gaussian random walks.
+
+## Drifting reward probabilities
+
+To implement the standard drifting-rewards version:
+
+```ts
+// In the experiment machine's collectResult action:
+actions: {
+  collectResult: assign(({ context, event }) => {
+    const output = event.output;
+    // Gaussian random walk on reward probabilities
+    const drift = () => Math.min(0.75, Math.max(0.25,
+      /* current */ 0.5 + (Math.random() - 0.5) * 0.05
+    ));
+
+    return {
+      responses: [...context.responses, output],
+      currentIndex: context.currentIndex + 1,
+      rewardProbabilities: {
+        A: [drift(), drift()] as [number, number],
+        B: [drift(), drift()] as [number, number],
+      },
+    };
+  }),
+}
+```
+
+## Links
+
+- Daw, N.D., Gershman, S.J., Seymour, B., Dayan, P., & Dolan, R.J. (2011). Model-based influences on humans' choices and striatal prediction errors. _Neuron_, 69(6), 1204-1215.
+- [Two-Armed Bandit example](/examples/bandit/) — simpler choice task
+- [Stately Visualizer](https://stately.ai/viz) — paste the machine definition to explore

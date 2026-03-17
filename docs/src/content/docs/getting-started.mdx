@@ -1,0 +1,245 @@
+---
+title: Getting Started
+description: Install jsPsych2 and create your first experiment in five minutes.
+---
+
+import { Steps, Tabs, TabItem, Code } from '@astrojs/starlight/components';
+
+## Installation
+
+<Tabs>
+  <TabItem label="pnpm">
+    ```bash
+    pnpm add @xstate-experiments/core xstate
+    ```
+  </TabItem>
+  <TabItem label="npm">
+    ```bash
+    npm install @xstate-experiments/core xstate
+    ```
+  </TabItem>
+</Tabs>
+
+## Your first experiment: a keyboard reaction time task
+
+We will build a minimal experiment that shows a fixation cross, then a stimulus, waits for a keypress, and records the response time. This demonstrates every layer of the architecture: a trial machine, an experiment machine, headless testing, and browser rendering.
+
+<Steps>
+
+1. ### Define the trial machine
+
+   A trial machine is a statechart that describes a single trial's lifecycle. Each state represents a phase: fixation, stimulus, response, feedback. Transitions between states are triggered by events (like a keypress) or by time (like a 500ms fixation duration).
+
+   ```ts
+   // trial.ts
+   import { setup, assign } from 'xstate';
+
+   export const keyboardTrialMachine = setup({
+     types: {} as {
+       context: {
+         stimulus: string;
+         validKeys: string[];
+         correctKey: string;
+         fixationDuration: number;
+         feedbackDuration: number;
+         response: string | null;
+         rt: number | null;
+         correct: boolean | null;
+         stimulusOnsetTime: number | null;
+       };
+       input: {
+         stimulus: string;
+         validKeys: string[];
+         correctKey: string;
+         fixationDuration?: number;
+         feedbackDuration?: number;
+       };
+       events: { type: 'KEYPRESS'; key: string; timestamp: number };
+       output: { response: string; rt: number; correct: boolean };
+     },
+     actions: {
+       recordStimulusOnset: assign({
+         stimulusOnsetTime: () => performance.now(),
+       }),
+       recordResponse: assign(({ context, event }) => ({
+         response: event.key,
+         rt: performance.now() - (context.stimulusOnsetTime ?? performance.now()),
+         correct: event.key === context.correctKey,
+       })),
+     },
+     guards: {
+       validKey: ({ context, event }) =>
+         context.validKeys.includes(event.key),
+     },
+     delays: {
+       fixationDelay: ({ context }) => context.fixationDuration,
+       feedbackDelay: ({ context }) => context.feedbackDuration,
+     },
+   }).createMachine({
+     id: 'keyboardTrial',
+     initial: 'fixation',
+     context: ({ input }) => ({
+       stimulus: input.stimulus,
+       validKeys: input.validKeys,
+       correctKey: input.correctKey,
+       fixationDuration: input.fixationDuration ?? 500,
+       feedbackDuration: input.feedbackDuration ?? 1000,
+       response: null,
+       rt: null,
+       correct: null,
+       stimulusOnsetTime: null,
+     }),
+     states: {
+       fixation: {
+         after: { fixationDelay: 'stimulus' },
+       },
+       stimulus: {
+         entry: 'recordStimulusOnset',
+         on: {
+           KEYPRESS: {
+             target: 'feedback',
+             guard: 'validKey',
+             actions: 'recordResponse',
+           },
+         },
+       },
+       feedback: {
+         after: { feedbackDelay: 'done' },
+       },
+       done: { type: 'final' },
+     },
+     output: ({ context }) => ({
+       response: context.response!,
+       rt: context.rt!,
+       correct: context.correct!,
+     }),
+   });
+   ```
+
+2. ### Wrap it in an experiment machine
+
+   The experiment machine invokes trial actors in sequence. It passes each task definition as input to the trial machine and collects the output when each trial completes.
+
+   ```ts
+   // experiment.ts
+   import { createExperimentMachine } from '@xstate-experiments/core';
+   import { keyboardTrialMachine } from './trial';
+
+   const tasks = [
+     { stimulus: '←', validKeys: ['f', 'j'], correctKey: 'f' },
+     { stimulus: '→', validKeys: ['f', 'j'], correctKey: 'j' },
+     { stimulus: '←', validKeys: ['f', 'j'], correctKey: 'f' },
+     { stimulus: '→', validKeys: ['f', 'j'], correctKey: 'j' },
+   ];
+
+   export const experimentMachine = createExperimentMachine({
+     id: 'arrowRT',
+     tasks,
+     trialMachine: keyboardTrialMachine,
+   });
+   ```
+
+3. ### Test it headlessly
+
+   No browser needed. Create an actor, send events, and assert on the resulting state and output.
+
+   ```ts
+   // experiment.test.ts
+   import { describe, it, expect } from 'vitest';
+   import { createActor } from 'xstate';
+   import { experimentMachine } from './experiment';
+
+   describe('arrow RT experiment', () => {
+     it('collects responses from all trials', async () => {
+       const actor = createActor(experimentMachine);
+       actor.start();
+
+       // Start the experiment
+       actor.send({ type: 'START' });
+
+       // The first trial is now in 'fixation' state.
+       // In a real test you would use fake timers to advance
+       // past the fixation delay, then send KEYPRESS events.
+       // Here we show the pattern:
+
+       const snap = actor.getSnapshot();
+       expect(snap.value).toEqual({
+         runningTrials: 'active',
+       });
+     });
+   });
+   ```
+
+4. ### Render it in the browser
+
+   The machine defines **what state the experiment is in**. Rendering is a separate concern that subscribes to state changes.
+
+   ```ts
+   // main.ts
+   import { createActor } from 'xstate';
+   import { experimentMachine } from './experiment';
+   import { keyboardInput } from '@xstate-experiments/core/actors/input';
+
+   const app = document.getElementById('app')!;
+   const actor = createActor(experimentMachine);
+
+   // Subscribe to state changes and re-render
+   actor.subscribe((snapshot) => {
+     if (snapshot.matches('instructions')) {
+       app.innerHTML = `
+         <h1>Arrow Direction Task</h1>
+         <p>Press <kbd>F</kbd> for left arrows, <kbd>J</kbd> for right arrows.</p>
+         <button id="start">Begin</button>
+       `;
+       document.getElementById('start')!.onclick = () =>
+         actor.send({ type: 'START' });
+
+     } else if (snapshot.matches({ runningTrials: 'active' })) {
+       const trial = snapshot.children.currentTrial;
+       if (!trial) return;
+       const ts = trial.getSnapshot();
+
+       if (ts.matches('fixation')) {
+         app.innerHTML = '<div class="fixation">+</div>';
+       } else if (ts.matches('stimulus')) {
+         app.innerHTML = `<div class="stimulus">${ts.context.stimulus}</div>`;
+       } else if (ts.matches('feedback')) {
+         const icon = ts.context.correct ? 'Correct' : 'Incorrect';
+         app.innerHTML = `<div class="feedback">${icon}</div>`;
+       }
+
+     } else if (snapshot.status === 'done') {
+       const data = snapshot.context.responses;
+       app.innerHTML = `<h1>Done!</h1><p>${data.length} trials completed.</p>`;
+     }
+   });
+
+   // Forward keyboard events to the current trial actor
+   document.addEventListener('keydown', (e) => {
+     const trial = actor.getSnapshot().children.currentTrial;
+     if (trial) {
+       trial.send({
+         type: 'KEYPRESS',
+         key: e.key,
+         timestamp: performance.now(),
+       });
+     }
+   });
+
+   actor.start();
+   ```
+
+</Steps>
+
+## What just happened
+
+You defined a trial as a statechart with four states. You wrapped it in an experiment machine that invokes trial actors in sequence. You tested the logic without a browser. You added rendering as a pure subscription to state changes.
+
+The trial machine doesn't know about the DOM. The experiment machine doesn't know about keyboard events. The renderer doesn't manage state. Each concern is isolated, testable, and replaceable.
+
+## Next steps
+
+- Read about [Statecharts](/concepts/statecharts/) to understand the formalism
+- Learn about [Actors](/concepts/actors/) and how they enable composition
+- Follow the [Your First Experiment](/guides/first-experiment/) tutorial for a deeper walkthrough
+- Browse the [Examples](/examples/bandit/) to see complete experiment implementations

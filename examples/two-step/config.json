@@ -1,0 +1,19 @@
+{
+  "taskId": "two-step",
+  "title": "Two-Step Task",
+  "description": "A two-stage decision task that reveals whether you use habits or planning.",
+  "numTrials": 200,
+  "parameters": {
+    "commonTransitionProb": 0.7,
+    "rewardDriftSigma": 0.025,
+    "rewardMin": 0.25,
+    "rewardMax": 0.75,
+    "fixationDuration": 500,
+    "stage1Timeout": 3000,
+    "stage2Timeout": 3000,
+    "feedbackDuration": 1000,
+    "itiDuration": 500
+  },
+  "instructions": "In this task, you'll make two choices per trial.\n\nFirst, choose one of two rockets. Each rocket usually takes you to a specific planet, but sometimes you end up at the other planet.\n\nOnce you arrive, choose one of two options on that planet. Each option has a chance of giving a reward, but these chances slowly change over time.\n\nYour goal: earn as many rewards as possible over 200 trials.\n\nPress 1 or 2 (or arrow keys) to choose.",
+  "debrief": "This task separates model-free (habitual) from model-based (planning) decision-making.\n\nA key diagnostic: after a rare transition + reward, model-free learners repeat the same rocket; model-based learners switch."
+}

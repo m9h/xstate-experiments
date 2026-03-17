@@ -1,0 +1,187 @@
+---
+title: Two-Armed Bandit
+description: A reinforcement learning task with Rescorla-Wagner value updating, demonstrating timed states and assign actions.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Overview
+
+The two-armed bandit is a classic reinforcement learning task. The participant chooses between two options ("arms"), each with a hidden reward probability. Over many trials, the participant learns which arm is more rewarding.
+
+### What this demonstrates
+
+- **Timed state transitions** — fixation (500ms) and feedback (1500ms) as delayed transitions
+- **Assign actions** — Rescorla-Wagner Q-value updating in a single action
+- **Stochastic reward generation** — reward probability evaluated in an action
+- **Structured output** — trial data includes Q-values, chosen arm, reward, and RT
+
+## State diagram
+
+```
+                  after 500ms                 CHOOSE (arm: 0 | 1)
+  [fixation] ──────────────> [stimulus] ──────────────────────────> [feedback]
+      |                          |                                      |
+      | entry:                   | entry:                               | after 1500ms
+      | recordFixationOnset      | recordStimulusOnset                  v
+                                                                     [done]
+                                                                       |
+                                                                       └── output: {
+                                                                             trialIndex,
+                                                                             chosenArm,
+                                                                             reward,
+                                                                             rt,
+                                                                             qValues,
+                                                                             updatedQValues
+                                                                           }
+```
+
+## Machine definition
+
+```ts
+import { setup, assign } from 'xstate';
+
+export const banditTrialMachine = setup({
+  types: {} as {
+    context: {
+      trialIndex: number;
+      rewardProbabilities: [number, number];
+      qValues: [number, number];
+      alpha: number;
+      chosenArm: 0 | 1 | null;
+      reward: 0 | 1 | null;
+      rt: number | null;
+      stimulusOnsetTime: number | null;
+      fixationOnsetTime: number | null;
+      updatedQValues: [number, number];
+    };
+    input: {
+      trialIndex: number;
+      rewardProbabilities: [number, number];
+      qValues: [number, number];
+      alpha: number;
+    };
+    events: { type: 'CHOOSE'; arm: 0 | 1 };
+    output: {
+      trialIndex: number;
+      chosenArm: 0 | 1;
+      reward: 0 | 1;
+      rt: number;
+      rewardProbabilities: [number, number];
+      qValues: [number, number];
+      updatedQValues: [number, number];
+    };
+  },
+  actions: {
+    recordFixationOnset: assign({
+      fixationOnsetTime: () => performance.now(),
+    }),
+    recordStimulusOnset: assign({
+      stimulusOnsetTime: () => performance.now(),
+    }),
+    processChoice: assign(({ context, event }) => {
+      const arm = event.arm;
+      // Stochastic reward based on hidden probability
+      const reward: 0 | 1 =
+        Math.random() < context.rewardProbabilities[arm] ? 1 : 0;
+      const rt =
+        performance.now() - (context.stimulusOnsetTime ?? performance.now());
+
+      // Rescorla-Wagner update: Q(a) += alpha * (R - Q(a))
+      const newQ: [number, number] = [...context.qValues] as [number, number];
+      newQ[arm] += context.alpha * (reward - newQ[arm]);
+
+      return {
+        chosenArm: arm,
+        reward,
+        rt,
+        updatedQValues: newQ,
+      };
+    }),
+  },
+}).createMachine({
+  id: 'banditTrial',
+  initial: 'fixation',
+  context: ({ input }) => ({
+    trialIndex: input.trialIndex,
+    rewardProbabilities: input.rewardProbabilities,
+    qValues: input.qValues,
+    alpha: input.alpha,
+    chosenArm: null,
+    reward: null,
+    rt: null,
+    stimulusOnsetTime: null,
+    fixationOnsetTime: null,
+    updatedQValues: input.qValues,
+  }),
+  states: {
+    fixation: {
+      entry: 'recordFixationOnset',
+      after: { 500: 'stimulus' },
+    },
+    stimulus: {
+      entry: 'recordStimulusOnset',
+      on: {
+        CHOOSE: {
+          target: 'feedback',
+          actions: 'processChoice',
+        },
+      },
+    },
+    feedback: {
+      after: { 1500: 'done' },
+    },
+    done: { type: 'final' },
+  },
+  output: ({ context }) => ({
+    trialIndex: context.trialIndex,
+    chosenArm: context.chosenArm!,
+    reward: context.reward!,
+    rt: context.rt!,
+    rewardProbabilities: context.rewardProbabilities,
+    qValues: context.qValues,
+    updatedQValues: context.updatedQValues,
+  }),
+});
+```
+
+## Running a bandit experiment
+
+The experiment machine invokes the bandit trial machine for each trial. Q-values carry forward across trials by threading the updated values as input to the next trial:
+
+```ts
+import { createExperimentMachine } from '@xstate-experiments/core';
+import { banditTrialMachine } from './bandit-trial';
+
+// Generate 100 trials with drifting reward probabilities
+const nTrials = 100;
+const tasks = Array.from({ length: nTrials }, (_, i) => ({
+  trialIndex: i,
+  rewardProbabilities: [0.7, 0.3] as [number, number],
+  qValues: [0.5, 0.5] as [number, number], // will be overridden from context
+  alpha: 0.1,
+}));
+
+const experiment = createExperimentMachine({
+  id: 'banditExperiment',
+  tasks,
+  trialMachine: banditTrialMachine,
+});
+```
+
+<Aside type="tip">
+To thread Q-values across trials, modify the experiment machine's `input` function to pass the previous trial's `updatedQValues` as the next trial's `qValues`. This keeps the learning state entirely within the machine context.
+</Aside>
+
+## Key design decisions
+
+**Why Rescorla-Wagner in an action?** The Q-value update is a pure computation on context. It belongs in an `assign` action because it transforms the machine's working memory without external side effects.
+
+**Why stochastic reward in an action?** `Math.random()` is technically a side effect, but it is a controlled one. The reward is generated at the moment of choice and stored in context. For reproducible experiments, you could replace `Math.random()` with a seeded PRNG passed through context.
+
+**Why separate fixation and feedback timers?** Delayed transitions (`after: { 500: 'stimulus' }`) are automatically cancelled if the machine leaves the state. This means pausing the experiment or aborting a trial does not leave dangling timeouts.
+
+## Links
+
+- [Full source](https://github.com/xstate-experiments/jsPsych2/tree/main/packages/core/src/machines/trials/bandit.ts)
+- [Stately Visualizer](https://stately.ai/viz) — paste the machine definition to see the interactive statechart

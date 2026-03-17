@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Go/No-Go — jsPsych2</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #eee; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+    #app { max-width: 800px; width: 100%; padding: 2rem; text-align: center; }
+
+    /* Shared screen layout */
+    .screen { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 60vh; gap: 1.5rem; }
+
+    /* Instructions */
+    .instructions-screen h1 { font-size: 2rem; color: #7dd3fc; }
+    .instructions-text { font-size: 1.1rem; line-height: 1.7; max-width: 600px; text-align: left; white-space: pre-line; }
+
+    /* Fixation cross */
+    .fixation-cross { font-size: 4rem; font-weight: bold; color: #888; }
+
+    /* Stimulus letter */
+    .stimulus-letter { font-size: 8rem; font-weight: bold; font-family: monospace; }
+
+    /* Feedback text */
+    .feedback-text { font-size: 2rem; font-weight: 600; }
+
+    /* Results */
+    .results-screen h1 { font-size: 2rem; color: #7dd3fc; }
+    .debrief-text { font-size: 1rem; line-height: 1.6; max-width: 600px; text-align: left; margin-bottom: 1rem; }
+    .results-table { border-collapse: collapse; margin: 1rem auto; }
+    .results-table th, .results-table td { padding: 0.6rem 1.2rem; border: 1px solid #444; text-align: left; }
+    .results-table th { background: #2a2a4e; color: #7dd3fc; }
+    .results-table td { background: #1e1e3a; }
+
+    /* Button */
+    .btn { padding: 0.8rem 2rem; font-size: 1.1rem; border: none; border-radius: 6px; background: #7dd3fc; color: #1a1a2e; cursor: pointer; font-weight: 600; transition: background 0.15s; }
+    .btn:hover { background: #38bdf8; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

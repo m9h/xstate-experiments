@@ -1,0 +1,20 @@
+{
+  "name": "@xstate-experiments/example-reversal-learning",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@xstate-experiments/core": "workspace:*",
+    "xstate": "^5.28.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.0"
+  }
+}

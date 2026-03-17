@@ -1,0 +1,234 @@
+---
+title: Go/No-Go
+description: An inhibitory control task demonstrating guard-based trial routing, response deadlines, and commission/omission error tracking.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Overview
+
+The Go/No-Go task measures inhibitory control. On "go" trials, the participant must respond quickly. On "no-go" trials, the participant must withhold their response. The key challenge is stopping a prepotent response.
+
+### What this demonstrates
+
+- **Guards for trial routing** — different evaluation paths for go vs. no-go trials
+- **Response deadlines** — delayed transition as a timeout
+- **Commission and omission errors** — structured evaluation using guards
+- **Mixed trial types** — a single machine handles both go and no-go trials
+
+## State diagram
+
+```
+              after fixationDuration
+  [fixation] ─────────────────────> [stimulus]
+                                       │
+                               ┌───────┴───────┐
+                               │               │
+                           KEYPRESS       after deadline
+                           (go trial)      (timeout)
+                               │               │
+                               v               v
+                          [evaluation]    [evaluation]
+                               │               │
+                     ┌─────────┴─────────┐     │
+                     │                   │     │
+               guard:               guard:     │
+             isCorrect            isIncorrect   │
+                     │                   │     │
+                     v                   v     v
+              [correctFeedback]  [incorrectFeedback]
+                     │                   │
+                     │ after fbDuration  │ after fbDuration
+                     v                   v
+                   [done]              [done]
+```
+
+## Machine definition
+
+```ts
+import { setup, assign } from 'xstate';
+
+export interface GoNoGoTrialInput {
+  trialType: 'go' | 'nogo';
+  stimulus: string;       // e.g., 'green' for go, 'blue' for nogo
+  responseDeadline: number;
+  fixationDuration?: number;
+  feedbackDuration?: number;
+}
+
+export interface GoNoGoTrialOutput {
+  trialType: 'go' | 'nogo';
+  response: string | null;
+  rt: number | null;
+  correct: boolean;
+  errorType: 'none' | 'commission' | 'omission';
+}
+
+export const goNoGoTrialMachine = setup({
+  types: {} as {
+    context: {
+      trialType: 'go' | 'nogo';
+      stimulus: string;
+      responseDeadline: number;
+      fixationDuration: number;
+      feedbackDuration: number;
+      response: string | null;
+      rt: number | null;
+      correct: boolean | null;
+      errorType: 'none' | 'commission' | 'omission';
+      stimulusOnsetTime: number | null;
+    };
+    input: GoNoGoTrialInput;
+    events: { type: 'KEYPRESS'; key: string; timestamp: number };
+    output: GoNoGoTrialOutput;
+  },
+  actions: {
+    recordStimulusOnset: assign({
+      stimulusOnsetTime: () => performance.now(),
+    }),
+    recordResponse: assign(({ context, event }) => ({
+      response: event.key,
+      rt: event.timestamp - (context.stimulusOnsetTime ?? event.timestamp),
+    })),
+    evaluateGoResponse: assign(({ context }) => {
+      // Go trial: correct if responded
+      if (context.response !== null) {
+        return { correct: true, errorType: 'none' as const };
+      }
+      // Go trial: omission error if no response
+      return { correct: false, errorType: 'omission' as const };
+    }),
+    evaluateNoGoResponse: assign(({ context }) => {
+      // No-go trial: correct if withheld
+      if (context.response === null) {
+        return { correct: true, errorType: 'none' as const };
+      }
+      // No-go trial: commission error if responded
+      return { correct: false, errorType: 'commission' as const };
+    }),
+  },
+  guards: {
+    isGoTrial: ({ context }) => context.trialType === 'go',
+    isNoGoTrial: ({ context }) => context.trialType === 'nogo',
+    isCorrect: ({ context }) => context.correct === true,
+    isIncorrect: ({ context }) => context.correct === false,
+  },
+  delays: {
+    fixation: ({ context }) => context.fixationDuration,
+    deadline: ({ context }) => context.responseDeadline,
+    feedback: ({ context }) => context.feedbackDuration,
+  },
+}).createMachine({
+  id: 'goNoGoTrial',
+  initial: 'fixation',
+  context: ({ input }) => ({
+    trialType: input.trialType,
+    stimulus: input.stimulus,
+    responseDeadline: input.responseDeadline,
+    fixationDuration: input.fixationDuration ?? 500,
+    feedbackDuration: input.feedbackDuration ?? 800,
+    response: null,
+    rt: null,
+    correct: null,
+    errorType: 'none' as const,
+    stimulusOnsetTime: null,
+  }),
+  states: {
+    fixation: {
+      after: { fixation: 'stimulus' },
+    },
+    stimulus: {
+      entry: 'recordStimulusOnset',
+      on: {
+        KEYPRESS: {
+          target: 'evaluation',
+          actions: 'recordResponse',
+        },
+      },
+      after: {
+        deadline: 'evaluation', // timeout: no response within deadline
+      },
+    },
+    evaluation: {
+      always: [
+        {
+          target: 'goEvaluation',
+          guard: 'isGoTrial',
+        },
+        {
+          target: 'noGoEvaluation',
+          guard: 'isNoGoTrial',
+        },
+      ],
+    },
+    goEvaluation: {
+      entry: 'evaluateGoResponse',
+      always: [
+        { target: 'correctFeedback', guard: 'isCorrect' },
+        { target: 'incorrectFeedback' },
+      ],
+    },
+    noGoEvaluation: {
+      entry: 'evaluateNoGoResponse',
+      always: [
+        { target: 'correctFeedback', guard: 'isCorrect' },
+        { target: 'incorrectFeedback' },
+      ],
+    },
+    correctFeedback: {
+      after: { feedback: 'done' },
+    },
+    incorrectFeedback: {
+      after: { feedback: 'done' },
+    },
+    done: { type: 'final' },
+  },
+  output: ({ context }) => ({
+    trialType: context.trialType,
+    response: context.response,
+    rt: context.rt,
+    correct: context.correct!,
+    errorType: context.errorType,
+  }),
+});
+```
+
+## Experiment setup
+
+```ts
+import { createExperimentMachine } from '@xstate-experiments/core';
+import { goNoGoTrialMachine } from './go-nogo-trial';
+
+// 75% go, 25% no-go — common ratio for prepotent response
+function generateTrials(n: number, goRatio = 0.75) {
+  const trials = [];
+  for (let i = 0; i < n; i++) {
+    const isGo = Math.random() < goRatio;
+    trials.push({
+      trialType: isGo ? 'go' : 'nogo',
+      stimulus: isGo ? 'green' : 'blue',
+      responseDeadline: 1000,
+    });
+  }
+  return trials;
+}
+
+const experiment = createExperimentMachine({
+  id: 'goNoGo',
+  tasks: generateTrials(60),
+  trialMachine: goNoGoTrialMachine,
+});
+```
+
+## Key design decisions
+
+**Why separate goEvaluation and noGoEvaluation states?** The evaluation logic differs by trial type — a response is correct on go trials but incorrect on no-go trials. Splitting the evaluation into two states makes this visible in the statechart and keeps each evaluation action simple.
+
+**Why guards instead of `if` statements?** Guards are visible in the Stately visualizer. You can see at a glance that the machine routes to different evaluation paths based on trial type. This is not possible with imperative logic hidden inside actions.
+
+**Error types as context.** Storing `errorType` in context (rather than computing it later) means the feedback renderer can display different messages for commission vs. omission errors without re-computing the logic.
+
+## Links
+
+- [Guards concept page](/concepts/guards/) — detailed explanation of guard mechanics
+- [Stately Visualizer](https://stately.ai/viz) — paste the machine definition to explore

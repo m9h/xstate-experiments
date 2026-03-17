@@ -1,0 +1,336 @@
+---
+title: Actions
+description: Side effects in jsPsych2 — entry/exit actions, assign actions for context updates, timing, and data recording.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## What are actions?
+
+Actions are side effects that run at specific points in the machine's lifecycle:
+
+- **Entry actions** — run when a state is entered
+- **Exit actions** — run when a state is exited
+- **Transition actions** — run during a transition (after exit, before entry)
+
+Actions are the only way to produce side effects in a statechart. Guards check conditions but do not change anything. Transitions move between states but do not do work. Actions do the work.
+
+```ts
+states: {
+  stimulus: {
+    entry: ['recordStimulusOnset', 'renderStimulus'],
+    exit: ['clearStimulus'],
+    on: {
+      KEYPRESS: {
+        target: 'feedback',
+        actions: ['recordResponse'],  // transition action
+      },
+    },
+  },
+}
+```
+
+## Assign actions: updating context
+
+The most common action type is `assign`, which updates the machine's context. Context is the machine's working memory — it stores trial parameters, accumulated data, timing marks, and anything else the machine needs to make decisions.
+
+```ts
+import { assign } from 'xstate';
+
+actions: {
+  recordStimulusOnset: assign({
+    stimulusOnsetTime: () => performance.now(),
+  }),
+
+  recordResponse: assign(({ context, event }) => ({
+    response: event.key,
+    rt: performance.now() - (context.stimulusOnsetTime ?? 0),
+    correct: event.key === context.correctKey,
+  })),
+
+  incrementTrialCount: assign({
+    trialsCompleted: ({ context }) => context.trialsCompleted + 1,
+  }),
+}
+```
+
+`assign` actions are pure in the sense that they return a new context value rather than mutating the existing one. XState handles the actual context update internally.
+
+<Aside type="caution">
+`assign` actions should be the **only** way to update context. Never mutate `context` directly inside an action function. XState depends on context immutability for correct state tracking and snapshot creation.
+</Aside>
+
+## Timing with actions
+
+Precise timing is critical for behavioral experiments. jsPsych2 records all timestamps via `performance.now()` in entry actions, ensuring that timing marks are captured at the exact moment a state is entered.
+
+### Recording stimulus onset
+
+```ts
+states: {
+  stimulus: {
+    entry: assign({
+      stimulusOnsetTime: () => performance.now(),
+    }),
+    on: {
+      KEYPRESS: {
+        target: 'feedback',
+        actions: assign(({ context, event }) => ({
+          response: event.key,
+          rt: event.timestamp - context.stimulusOnsetTime,
+        })),
+      },
+    },
+  },
+}
+```
+
+Note that we use `event.timestamp` (set by the keyboard input actor at the time of the DOM event) rather than calling `performance.now()` in the transition action. This avoids including XState's event processing overhead in the RT measurement.
+
+### Delayed transitions as timers
+
+Timed phases (fixation durations, feedback displays) use XState's delayed transitions rather than `setTimeout`:
+
+```ts
+states: {
+  fixation: {
+    after: { 500: 'stimulus' },  // Transition after 500ms
+  },
+  feedback: {
+    after: {
+      feedbackDelay: 'done',     // Dynamic delay from context
+    },
+  },
+}
+
+// Dynamic delay reads from context:
+delays: {
+  feedbackDelay: ({ context }) => context.feedbackDuration,
+}
+```
+
+Delayed transitions are automatically cancelled when the machine exits the state (e.g., if the experiment is paused or aborted). No manual `clearTimeout` needed.
+
+### Frame-accurate timing
+
+For timing-critical paradigms (visual psychophysics, backward masking), stimulus onset should be synchronized with the display refresh cycle. The timing monitor actor handles this:
+
+```ts
+import { timingMonitor } from '@xstate-experiments/core';
+
+// The timing monitor runs a rAF loop and reports frame drops.
+// Use it alongside your experiment to detect timing issues:
+
+// In your experiment machine (parallel state):
+invoke: {
+  id: 'timingMonitor',
+  src: timingMonitor,
+  input: { threshold: 20 }, // ms — flag frames > 20ms
+}
+```
+
+For rendering that needs to be synchronized with `requestAnimationFrame`, coordinate through the rendering subscription rather than through machine actions. The machine records the _intended_ onset time; the renderer ensures the stimulus appears on the next frame.
+
+## Data recording as structured actions
+
+In jsPsych, data recording happens through `jsPsych.finishTrial(data)` — a single function call that dumps an object into the global data store. In jsPsych2, data recording is the natural result of context updates flowing through the actor hierarchy.
+
+### Trial-level data
+
+Each trial machine accumulates its data in context via `assign` actions, then exposes it as typed output:
+
+```ts
+// Actions throughout the trial build up the data:
+actions: {
+  recordFixationOnset: assign({
+    fixationOnsetTime: () => performance.now(),
+  }),
+  recordStimulusOnset: assign({
+    stimulusOnsetTime: () => performance.now(),
+  }),
+  recordResponse: assign(({ context, event }) => ({
+    response: event.key,
+    rt: event.timestamp - context.stimulusOnsetTime,
+    correct: event.key === context.correctKey,
+  })),
+}
+
+// The output function selects what to emit:
+output: ({ context }) => ({
+  response: context.response,
+  rt: context.rt,
+  correct: context.correct,
+  stimulusOnsetTime: context.stimulusOnsetTime,
+})
+```
+
+### Collecting results upward
+
+The experiment machine collects trial outputs with a `collectResult` action:
+
+```ts
+actions: {
+  collectResult: assign({
+    responses: ({ context, event }) => {
+      const output = event.output;
+      return [...context.responses, output];
+    },
+    currentIndex: ({ context }) => context.currentIndex + 1,
+  }),
+}
+```
+
+This action runs when the trial actor completes (the `onDone` transition). The trial's output is appended to the experiment's `responses` array, and the trial index advances.
+
+### Background data persistence
+
+The data collector actor can persist data to a backend as the experiment runs:
+
+```ts
+// The data collector buffers trial results:
+on: {
+  RECORD_TRIAL: [
+    {
+      target: 'flushing',
+      guard: 'shouldAutoFlush',  // buffer full
+      actions: 'bufferTrial',
+    },
+    {
+      target: 'idle',
+      actions: 'bufferTrial',
+    },
+  ],
+}
+```
+
+The data collector is completely decoupled from the trial machines. It listens for `RECORD_TRIAL` events, buffers them, and flushes to a backend when the buffer exceeds a threshold. If the flush fails, the buffer is preserved for retry. The experiment continues regardless.
+
+## Action ordering
+
+Actions execute in a specific order during a transition:
+
+1. **Exit actions** of the current state (innermost first)
+2. **Transition actions** on the transition itself
+3. **Entry actions** of the target state (outermost first)
+
+This matters when an action in step 2 needs data from step 1, or when entry actions depend on context updates from the transition.
+
+```ts
+states: {
+  stimulus: {
+    exit: ['logStimulusOffset'],
+    on: {
+      KEYPRESS: {
+        target: 'feedback',
+        actions: ['recordResponse'],  // Runs after exit, before entry
+      },
+    },
+  },
+  feedback: {
+    entry: ['renderFeedback'],  // Runs last — has access to response data
+  },
+}
+```
+
+## Named actions for testability
+
+Define actions as named strings in the `setup()` block rather than inline functions:
+
+```ts
+// Preferred: named actions
+const machine = setup({
+  actions: {
+    recordResponse: assign(({ context, event }) => ({
+      response: event.key,
+      rt: event.timestamp - context.stimulusOnsetTime,
+    })),
+  },
+}).createMachine({
+  states: {
+    stimulus: {
+      on: {
+        KEYPRESS: { actions: 'recordResponse', target: 'feedback' },
+      },
+    },
+  },
+});
+```
+
+Named actions appear in the machine's serialized configuration and in the Stately visualizer. They make the statechart diagram self-documenting — you can see exactly what happens at each transition without reading the implementation.
+
+They also enable action replacement in tests. You can provide mock implementations when creating a test actor:
+
+```ts
+const actor = createActor(machine, {
+  // Override specific actions for testing
+  // (mock rendering, disable network calls, etc.)
+});
+```
+
+## Common action patterns
+
+### Rescorla-Wagner update (reinforcement learning)
+
+```ts
+actions: {
+  processChoice: assign(({ context, event }) => {
+    const arm = event.arm;
+    const reward = Math.random() < context.rewardProbabilities[arm] ? 1 : 0;
+    const newQ = [...context.qValues];
+    newQ[arm] += context.alpha * (reward - newQ[arm]);
+    return {
+      chosenArm: arm,
+      reward,
+      rt: performance.now() - context.stimulusOnsetTime,
+      updatedQValues: newQ,
+    };
+  }),
+}
+```
+
+### Grid evaluation (ARC tasks)
+
+```ts
+actions: {
+  evaluate: assign(({ context }) => {
+    let total = 0, correctCells = 0;
+    const expected = context.task.test[0].output;
+    for (let r = 0; r < expected.length; r++) {
+      for (let c = 0; c < expected[0].length; c++) {
+        total++;
+        if (context.submittedGrid?.[r]?.[c] === expected[r][c]) {
+          correctCells++;
+        }
+      }
+    }
+    return {
+      correct: total === correctCells,
+      accuracy: total > 0 ? correctCells / total : 0,
+      attempt: context.attempt + 1,
+    };
+  }),
+}
+```
+
+### Randomization and shuffling
+
+```ts
+actions: {
+  shuffleTrials: assign({
+    tasks: ({ context }) => {
+      const shuffled = [...context.tasks];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      return shuffled;
+    },
+  }),
+}
+```
+
+## Further reading
+
+- [Statecharts](/concepts/statecharts/) — the state model that actions operate within
+- [Guards](/concepts/guards/) — conditional logic that gates transitions before actions run
+- [API Reference: Core](/api/core/) — full API documentation for built-in actions and utilities

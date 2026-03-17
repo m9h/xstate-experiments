@@ -1,0 +1,210 @@
+---
+title: Actors
+description: The actor model in jsPsych2 — how trial types, data collectors, and input handlers compose as independent actors.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## What are actors?
+
+In XState v5, an actor is an independent unit of computation that:
+
+- Has its own **internal state** (context)
+- Receives **input** from its parent when spawned
+- Processes **events** according to its own statechart
+- Emits **output** when it reaches a final state
+- Is **isolated** — it cannot directly read or write its parent's state
+
+Actors communicate through a strict protocol: the parent sends input when it invokes the actor, the actor sends events back to the parent, and the parent receives the actor's output when it completes. There is no shared mutable state.
+
+This maps directly to behavioral experiments. A trial is an actor that receives stimulus parameters, manages its own internal phases, and emits response data when it finishes.
+
+## Trial types as actors
+
+Every trial type in jsPsych2 is an invoked actor machine. Consider the keyboard response trial:
+
+```ts
+// The parent (experiment machine) invokes the trial actor:
+invoke: {
+  id: 'currentTrial',
+  src: 'trialMachine',
+  input: ({ context }) => ({
+    task: context.tasks[context.currentIndex],
+    taskIndex: context.currentIndex,
+  }),
+  onDone: {
+    target: 'checkNext',
+    actions: 'collectResult',
+  },
+}
+```
+
+The trial actor:
+
+| Aspect | Description |
+|---|---|
+| **Input** | Stimulus parameters, valid keys, correct answer |
+| **Internal states** | fixation, stimulus, response, feedback, done |
+| **Events it handles** | `KEYPRESS` with key and timestamp |
+| **Output** | `{ response, rt, correct }` |
+
+The parent machine does not know or care about the trial's internal states. It only knows that it invoked a trial actor, and that the actor will eventually reach a final state and emit output. This separation is what makes trial types interchangeable.
+
+## The invocation lifecycle
+
+When an actor is invoked:
+
+1. **Creation** — The parent passes `input` to the actor. The actor initializes its context from that input.
+2. **Running** — The actor processes events according to its own statechart. The parent can send events to the actor via `actor.send()`.
+3. **Completion** — The actor reaches a final state. Its `output` function computes the result from context. The parent's `onDone` transition fires with the output.
+4. **Cleanup** — The actor is stopped and removed from the parent's children.
+
+```
+Parent machine                     Trial actor
+     |                                  |
+     |-- invoke with input ------------>|
+     |                                  |-- enters 'fixation'
+     |                                  |-- after 500ms -> 'stimulus'
+     |   KEYPRESS event forwarded ----->|-- recordResponse
+     |                                  |-- enters 'feedback'
+     |                                  |-- after 1000ms -> 'done' (final)
+     |<-- onDone with output -----------|
+     |-- collectResult action           |
+     |-- transition to 'checkNext'      X (actor stopped)
+```
+
+## Composability: experiments invoke blocks invoke trials
+
+The actor model enables arbitrary nesting. A typical experiment has three levels:
+
+```
+experimentActor
+├── invokes blockActor[0]
+│   ├── invokes trialActor[0]  → output → collected
+│   ├── invokes trialActor[1]  → output → collected
+│   └── invokes trialActor[2]  → output → collected
+│   → block output (all trial results)
+├── invokes blockActor[1]
+│   ├── invokes trialActor[0]  → output → collected
+│   └── invokes trialActor[1]  → output → collected
+│   → block output
+└── experiment final state
+    → all block results available
+```
+
+Data flows **upward** through actor outputs. Each trial emits its results. The block collects all trial results and emits them as block output. The experiment collects all block outputs.
+
+This is fundamentally different from jsPsych's approach, where a global `jsPsych.data` object accumulates results through side effects. In jsPsych2, data flow is explicit and type-safe.
+
+## Background actors
+
+Not all actors follow the invoke-and-complete pattern. Some run in parallel with the main experiment flow, handling cross-cutting concerns:
+
+### Data collector
+
+The data collector actor buffers trial results and flushes them to a backend endpoint:
+
+```ts
+import { dataCollectorMachine } from '@xstate-experiments/core';
+
+// The data collector runs as a background actor
+// It responds to RECORD_TRIAL, FLUSH, and STOP events
+```
+
+It sits in an `idle` state, accumulating trial results in its buffer. When the buffer exceeds a threshold (or on a manual `FLUSH` event), it transitions to `flushing`, sends the data to the endpoint via a promise actor, and returns to `idle`. If the flush fails, the buffer is preserved for retry.
+
+### Timing monitor
+
+The timing monitor runs a `requestAnimationFrame` loop alongside the experiment and reports dropped frames:
+
+```ts
+import { timingMonitor } from '@xstate-experiments/core';
+
+// Uses fromCallback to run a rAF loop
+// Sends TIMING.FRAME_DROP events to parent when frames take > 20ms
+```
+
+This is a callback actor (not a machine) because it doesn't have internal states — it just runs a loop and reports. The parent can react to frame-drop events however it wants: log them, warn the participant, or flag the data for exclusion.
+
+### Keyboard and mouse input
+
+Input actors listen for DOM events and forward them as typed XState events:
+
+```ts
+import { keyboardInput, mouseInput } from '@xstate-experiments/core';
+
+// keyboardInput: listens for keydown, sends KEYPRESS events
+// mouseInput: listens for click, sends CLICK events
+// Both accept optional filters (validKeys, CSS selector)
+```
+
+These actors are created with `fromCallback`, which means they automatically clean up their event listeners when the parent actor stops them. No manual cleanup, no dangling listeners.
+
+<Aside type="caution">
+Input actors are thin wrappers around browser APIs. They should **not** contain experiment logic. Their job is to translate DOM events into typed XState events. All decision-making (which keys are valid, what a click means) belongs in the trial machine's guards and transitions.
+</Aside>
+
+## Custom trial actors
+
+Building a new trial type means creating a new machine with the actor contract:
+
+```ts
+import { setup, assign } from 'xstate';
+
+export const myTrialMachine = setup({
+  types: {} as {
+    // 1. Define the input your trial needs
+    input: { stimulus: string; difficulty: number };
+    // 2. Define the events your trial responds to
+    events: { type: 'RESPONSE'; value: number };
+    // 3. Define the output your trial emits
+    output: { response: number; rt: number; correct: boolean };
+    context: { /* ... */ };
+  },
+  // 4. Define actions, guards, delays
+  actions: { /* ... */ },
+  guards: { /* ... */ },
+}).createMachine({
+  id: 'myTrial',
+  initial: 'fixation',
+  context: ({ input }) => ({
+    // Initialize from input
+  }),
+  states: {
+    // 5. Define the trial's internal lifecycle
+    fixation: { /* ... */ },
+    stimulus: { /* ... */ },
+    response: { /* ... */ },
+    done: { type: 'final' },
+  },
+  // 6. Compute output from final context
+  output: ({ context }) => ({
+    response: context.response!,
+    rt: context.rt!,
+    correct: context.correct!,
+  }),
+});
+```
+
+This machine can be passed to `createExperimentMachine` as the `trialMachine` parameter, and it will be invoked for each task in the experiment. The experiment machine does not need to know anything about the trial's internal structure — only that it accepts input and emits output.
+
+## Actors vs. jsPsych plugins
+
+| jsPsych plugin | jsPsych2 actor |
+|---|---|
+| Class with `trial()` method | Machine with states and transitions |
+| Receives `display_element` and `trial` params | Receives typed `input` |
+| Calls `jsPsych.finishTrial(data)` | Reaches final state, emits typed `output` |
+| Manually manages DOM, timing, cleanup | Rendering is a separate subscription |
+| `simulate()` method duplicates logic | Same machine runs headlessly |
+| Instance variables track internal state | Context with assign actions |
+| Lifecycle hooks (`on_start`, `on_finish`) | Entry/exit actions on states |
+
+The actor model eliminates the most common sources of plugin bugs: forgotten cleanup, state desynchronization between the plugin and jsPsych's internals, and the inability to test without a browser.
+
+## Further reading
+
+- [Statecharts](/concepts/statecharts/) — the formalism that actors implement
+- [Guards](/concepts/guards/) — how actors make decisions
+- [Actions](/concepts/actions/) — how actors produce side effects
+- [API Reference: Core](/api/core/) — full API for creating experiment, block, and trial machines

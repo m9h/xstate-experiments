@@ -1,0 +1,468 @@
+---
+title: "Core API Reference"
+description: "API reference for @xstate-experiments/core — machine factories, trial machines, actors, and utilities."
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Installation
+
+```bash
+pnpm add @xstate-experiments/core xstate
+```
+
+## Machine factories
+
+### `createExperimentMachine(config)`
+
+Creates a top-level experiment machine that orchestrates a sequence of trials.
+
+**Import:**
+```ts
+import { createExperimentMachine } from '@xstate-experiments/core';
+```
+
+**Config:**
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `id` | `string` | — | Unique experiment identifier. Used as the machine's `id` and in state paths. |
+| `tasks` | `unknown[]` | — | Array of task/trial definitions. Each element is passed to the trial actor as input. |
+| `trialMachine` | `AnyActorLogic` | — | The trial machine to invoke for each task. |
+| `extraContext` | `Record<string, unknown>` | `{}` | Additional context fields merged into the experiment context. |
+| `showInstructions` | `boolean` | `true` | Whether to show an `instructions` state before trials begin. |
+| `showResults` | `boolean` | `true` | Whether to show a `results` final state. |
+
+**Statechart:**
+```
+instructions ──START──> runningTrials.active ──onDone──> runningTrials.checkNext
+                                                              │
+                                                    ┌────────┴────────┐
+                                                    │                 │
+                                              hasMoreTasks        (fallback)
+                                                    │                 │
+                                                    v                 v
+                                              .active            results (final)
+```
+
+**Context:**
+
+| Field | Type | Description |
+|---|---|---|
+| `tasks` | `unknown[]` | The task array from config |
+| `currentIndex` | `number` | Index of the current task (0-based) |
+| `responses` | `unknown[]` | Collected trial outputs |
+| `startTime` | `number \| null` | `performance.now()` when trials began |
+
+**Events:**
+- `START` — transitions from `instructions` to `runningTrials`
+
+**Guards:**
+- `hasMoreTasks` — `context.currentIndex < context.tasks.length`
+
+**Actions:**
+- `collectResult` — appends trial output to `responses`, increments `currentIndex`
+- `recordStartTime` — sets `startTime` to `performance.now()`
+
+**Usage:**
+```ts
+const experiment = createExperimentMachine({
+  id: 'myExperiment',
+  tasks: [{ stimulus: 'A' }, { stimulus: 'B' }],
+  trialMachine: myTrialMachine,
+});
+```
+
+---
+
+### `createBlockMachine(config)`
+
+<Aside type="note">
+Block-level machines are typically created manually as XState machines with the same invocation pattern as the experiment machine. A `createBlockMachine` factory is planned for a future release.
+</Aside>
+
+The block machine pattern follows the same structure as the experiment machine but operates at the trial level:
+
+```ts
+const blockMachine = setup({
+  actors: { trialMachine },
+  actions: {
+    collectTrialResult: assign({ /* ... */ }),
+  },
+  guards: {
+    hasMoreTrials: ({ context }) =>
+      context.currentTrialIndex < context.trials.length,
+  },
+}).createMachine({
+  id: 'block',
+  initial: 'active',
+  context: { /* trials, currentTrialIndex, results */ },
+  states: {
+    active: {
+      invoke: {
+        src: 'trialMachine',
+        input: ({ context }) => context.trials[context.currentTrialIndex],
+        onDone: { target: 'checkNext', actions: 'collectTrialResult' },
+      },
+    },
+    checkNext: {
+      always: [
+        { target: 'active', guard: 'hasMoreTrials' },
+        { target: 'done' },
+      ],
+    },
+    done: { type: 'final' },
+  },
+});
+```
+
+---
+
+### `createTrialMachine(config)`
+
+<Aside type="note">
+There is no generic `createTrialMachine` factory. Trial machines are domain-specific statecharts. Use the built-in trial machines below or create your own following the [actor contract](/concepts/actors/).
+</Aside>
+
+---
+
+## Built-in trial machines
+
+### `banditTrialMachine`
+
+Two-armed bandit trial with Rescorla-Wagner value updating.
+
+**Import:**
+```ts
+import { banditTrialMachine } from '@xstate-experiments/core';
+```
+
+**Input:**
+
+| Field | Type | Description |
+|---|---|---|
+| `trialIndex` | `number` | Position in the trial sequence |
+| `rewardProbabilities` | `[number, number]` | Hidden reward probability for each arm |
+| `qValues` | `[number, number]` | Current Q-values (carry forward from previous trial) |
+| `alpha` | `number` | Learning rate for Rescorla-Wagner update |
+
+**Events:**
+- `CHOOSE` — `{ type: 'CHOOSE'; arm: 0 | 1 }`
+
+**Output:**
+
+| Field | Type | Description |
+|---|---|---|
+| `trialIndex` | `number` | Position in sequence |
+| `chosenArm` | `0 \| 1` | Which arm was chosen |
+| `reward` | `0 \| 1` | Whether reward was received |
+| `rt` | `number` | Response time in ms |
+| `rewardProbabilities` | `[number, number]` | The reward probabilities for this trial |
+| `qValues` | `[number, number]` | Q-values at trial start |
+| `updatedQValues` | `[number, number]` | Q-values after Rescorla-Wagner update |
+
+**States:** `fixation` (500ms) -> `stimulus` -> `feedback` (1500ms) -> `done`
+
+---
+
+### `keyboardTrialMachine`
+
+Generic keyboard response trial.
+
+**Import:**
+```ts
+import { keyboardTrialMachine } from '@xstate-experiments/core';
+```
+
+**Input:**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `stimulus` | `string` | — | Stimulus to display |
+| `validKeys` | `string[]` | — | Keys accepted as responses |
+| `correctKey` | `string` | — | The correct response key |
+| `fixationDuration` | `number` | `500` | Fixation duration in ms |
+| `feedbackDuration` | `number` | `1000` | Feedback duration in ms |
+
+**Events:**
+- `KEYPRESS` — `{ type: 'KEYPRESS'; key: string; timestamp: number }`
+
+**Output:**
+
+| Field | Type | Description |
+|---|---|---|
+| `response` | `string` | The key pressed |
+| `rt` | `number` | Response time in ms |
+| `correct` | `boolean` | Whether the response matched `correctKey` |
+
+**States:** `fixation` -> `stimulus` -> `feedback` -> `done`
+
+**Guards:**
+- `validKey` — only transitions on keys in `validKeys`
+
+---
+
+## Actors
+
+### `keyboardInput`
+
+Callback actor that listens for `keydown` events and forwards them as `KEYPRESS` events.
+
+**Import:**
+```ts
+import { keyboardInput } from '@xstate-experiments/core';
+```
+
+**Input:**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `validKeys` | `string[]` | `undefined` | If provided, only these keys are forwarded. If omitted, all keys are forwarded. |
+
+**Events sent to parent:**
+- `KEYPRESS` — `{ type: 'KEYPRESS'; key: string; code: string; timestamp: number }`
+
+**Cleanup:** Removes the `keydown` listener when the actor is stopped.
+
+---
+
+### `mouseInput`
+
+Callback actor that listens for `click` events and forwards them as `CLICK` events.
+
+**Import:**
+```ts
+import { mouseInput } from '@xstate-experiments/core';
+```
+
+**Input:**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `selector` | `string` | `undefined` | CSS selector for the target element. If omitted, listens on `document`. |
+
+**Events sent to parent:**
+- `CLICK` — `{ type: 'CLICK'; x: number; y: number; timestamp: number; target: DOMStringMap }`
+
+**Cleanup:** Removes the `click` listener when the actor is stopped.
+
+---
+
+### `timingMonitor`
+
+Callback actor that runs a `requestAnimationFrame` loop and reports dropped frames.
+
+**Import:**
+```ts
+import { timingMonitor } from '@xstate-experiments/core';
+```
+
+**Input:**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `threshold` | `number` | `20` | Frame duration threshold in ms. Frames longer than this are reported as drops. |
+
+**Events sent to parent:**
+- `TIMING.FRAME_DROP` — `{ type: 'TIMING.FRAME_DROP'; droppedFrames: number; timestamp: number }`
+
+**Cleanup:** Cancels the rAF loop when the actor is stopped.
+
+---
+
+### `dataCollectorMachine`
+
+Machine actor that buffers trial results and can flush them to a backend endpoint.
+
+**Import:**
+```ts
+import { dataCollectorMachine } from '@xstate-experiments/core';
+```
+
+**Events:**
+
+| Event | Payload | Description |
+|---|---|---|
+| `RECORD_TRIAL` | `{ data: TrialResult }` | Add a trial result to the buffer |
+| `FLUSH` | — | Trigger manual flush to endpoint |
+| `EXPORT` | — | Log all collected data to console |
+| `STOP` | — | Transition to final state |
+
+**Context:**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `buffer` | `TrialResult[]` | `[]` | Unflushed trial results |
+| `flushedCount` | `number` | `0` | Number of results successfully flushed |
+| `flushEndpoint` | `string \| null` | `null` | URL to POST data to |
+| `autoFlushThreshold` | `number` | `10` | Buffer size that triggers auto-flush |
+| `allData` | `TrialResult[]` | `[]` | Complete record of all collected data |
+
+**States:** `idle` -> `flushing` (invoke promise) -> `idle` / `done`
+
+**Guards:**
+- `shouldAutoFlush` — endpoint exists AND buffer exceeds threshold
+- `hasEndpoint` — endpoint is not null
+
+---
+
+## Utility functions
+
+### `now()`
+
+Wrapper around `performance.now()` for testability and mocking.
+
+```ts
+import { now } from '@xstate-experiments/core';
+const timestamp = now();
+```
+
+### `onNextFrame(callback)`
+
+Schedules a callback on the next animation frame. Returns a cancel function.
+
+```ts
+import { onNextFrame } from '@xstate-experiments/core';
+const cancel = onNextFrame((timestamp) => {
+  // Render on next frame
+});
+// Later:
+cancel();
+```
+
+### `evaluateGrid(submitted, expected)`
+
+Cell-by-cell comparison of two 2D number arrays. Used by the ARC trial machine.
+
+```ts
+import { evaluateGrid } from '@xstate-experiments/core';
+
+const result = evaluateGrid(
+  [[0, 1], [1, 0]],
+  [[0, 1], [1, 1]],
+);
+// { correct: false, accuracy: 0.75, totalCells: 4, correctCells: 3 }
+```
+
+| Return field | Type | Description |
+|---|---|---|
+| `correct` | `boolean` | `true` if all cells match |
+| `accuracy` | `number` | Fraction of cells that match (0-1) |
+| `totalCells` | `number` | Total number of cells compared |
+| `correctCells` | `number` | Number of matching cells |
+
+---
+
+## Guard helpers
+
+These are factory functions that return guard functions for common experiment patterns.
+
+### `afterNCorrect(n)`
+
+Returns a guard that checks if `consecutiveCorrect >= n`.
+
+```ts
+guards: {
+  practiceComplete: afterNCorrect(5),
+}
+```
+
+### `afterNTrials(n)`
+
+Returns a guard that checks if `trialsCompleted >= n`.
+
+```ts
+guards: {
+  blockComplete: afterNTrials(40),
+}
+```
+
+### `staircaseRule(options)`
+
+Returns a guard for staircase stopping criteria.
+
+```ts
+guards: {
+  staircaseDone: staircaseRule({
+    maxReversals: 8,
+    minTrials: 20,
+  }),
+}
+```
+
+---
+
+## TypeScript types
+
+### `ExperimentConfig`
+
+```ts
+interface ExperimentConfig {
+  id: string;
+  tasks: unknown[];
+  trialMachine: AnyActorLogic;
+  extraContext?: Record<string, unknown>;
+  showInstructions?: boolean;
+  showResults?: boolean;
+}
+```
+
+### `ExperimentContext`
+
+```ts
+interface ExperimentContext {
+  tasks: unknown[];
+  currentIndex: number;
+  responses: unknown[];
+  startTime: number | null;
+  [key: string]: unknown;
+}
+```
+
+### `BanditTrialInput` / `BanditTrialOutput`
+
+```ts
+interface BanditTrialInput {
+  trialIndex: number;
+  rewardProbabilities: [number, number];
+  qValues: [number, number];
+  alpha: number;
+}
+
+interface BanditTrialOutput {
+  trialIndex: number;
+  chosenArm: 0 | 1;
+  reward: 0 | 1;
+  rt: number;
+  rewardProbabilities: [number, number];
+  qValues: [number, number];
+  updatedQValues: [number, number];
+}
+```
+
+### `KeyboardTrialInput` / `KeyboardTrialOutput`
+
+```ts
+interface KeyboardTrialInput {
+  stimulus: string;
+  validKeys: string[];
+  correctKey: string;
+  fixationDuration?: number;
+  feedbackDuration?: number;
+}
+
+interface KeyboardTrialOutput {
+  response: string;
+  rt: number;
+  correct: boolean;
+}
+```
+
+### `TrialResult`
+
+```ts
+interface TrialResult {
+  trialIndex: number;
+  [key: string]: unknown;
+}
+```

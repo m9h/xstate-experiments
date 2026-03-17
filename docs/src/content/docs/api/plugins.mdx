@@ -1,0 +1,358 @@
+---
+title: "Plugins API Reference"
+description: "API reference for jsPsych2 plugin packages — pre-built trial machines for common paradigms."
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Overview
+
+Plugin packages provide pre-built trial machines for common experimental paradigms. Each plugin exports a factory function that creates a configured XState machine following the [actor contract](/concepts/actors/).
+
+Unlike jsPsych v7 plugins (which are classes with lifecycle methods), jsPsych2 plugins are statechart factories. They return XState machines with typed inputs, outputs, and events. The machine handles all trial logic; rendering is a separate concern.
+
+---
+
+## plugin-html-keyboard
+
+HTML stimulus with keyboard response collection.
+
+**Install:**
+```bash
+pnpm add @xstate-experiments/plugin-html-keyboard
+```
+
+**Import:**
+```ts
+import { createHtmlKeyboardTrialMachine } from '@xstate-experiments/plugin-html-keyboard';
+```
+
+### `createHtmlKeyboardTrialMachine(config)`
+
+**Config:**
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `stimulus` | `string` | — | HTML string rendered as the stimulus |
+| `choices` | `string[]` | — | Keyboard keys accepted as valid responses. Empty array accepts all keys. |
+| `correctResponse` | `string` | `null` | The correct key. If provided, enables feedback and accuracy scoring. |
+| `stimulusDuration` | `number \| null` | `null` | ms to display the stimulus. `null` = wait for response. |
+| `trialDuration` | `number \| null` | `null` | Total trial timeout in ms. `null` = no limit. |
+| `responsePendsOnEnd` | `boolean` | `true` | If `true`, response immediately ends the trial (transitions to feedback/done). |
+| `fixationDuration` | `number` | `500` | Duration of fixation cross in ms. |
+| `feedbackDuration` | `number` | `1000` | Duration of feedback display in ms. `0` skips feedback. |
+
+**Statechart:**
+```
+fixation ──after fixationDelay──> stimulus ──KEYPRESS(valid)──> response
+                                     │                           │
+                                     │ after stimulusTimeout      │ always (if responsePends)
+                                     v                           v
+                                  response                   feedback ──after fbDelay──> done
+                                                                │
+                                                           (or directly to done if no feedback)
+```
+
+**Events:**
+- `KEYPRESS` — `{ type: 'KEYPRESS'; key: string; timestamp: number }`
+
+**Output:**
+
+| Field | Type | Description |
+|---|---|---|
+| `stimulus` | `string` | The HTML stimulus that was shown |
+| `response` | `string \| null` | Key pressed, or `null` if timed out |
+| `rt` | `number \| null` | Response time in ms, or `null` if no response |
+| `correct` | `boolean \| null` | Correctness, or `null` if no `correctResponse` configured |
+
+**Usage:**
+```ts
+const trial = createHtmlKeyboardTrialMachine({
+  stimulus: '<p style="font-size: 48px">+</p>',
+  choices: ['f', 'j'],
+  correctResponse: 'j',
+  fixationDuration: 500,
+  feedbackDuration: 1000,
+});
+```
+
+---
+
+## plugin-canvas
+
+Canvas-based trial with click and keyboard response support. Designed for tasks that need pixel-level rendering control.
+
+**Install:**
+```bash
+pnpm add @xstate-experiments/plugin-canvas
+```
+
+**Import:**
+```ts
+import { createCanvasTrialMachine } from '@xstate-experiments/plugin-canvas';
+```
+
+### `createCanvasTrialMachine(config)`
+
+**Config:**
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `canvasSize` | `[number, number]` | — | `[width, height]` of the canvas in pixels |
+| `stimulusDuration` | `number \| null` | `null` | ms to display stimulus. `null` = wait for response. |
+| `responsePendsOnEnd` | `boolean` | `true` | If `true`, first response ends the trial. |
+| `fixationDuration` | `number` | `500` | Fixation duration in ms. |
+| `backgroundColor` | `string` | `'#ffffff'` | Canvas background color. |
+| `trialDuration` | `number \| null` | `null` | Total trial timeout in ms. |
+
+**Statechart:**
+```
+fixation ──after fixationDelay──> stimulus ──CANVAS_CLICK/KEYPRESS──> response/done
+                                     │
+                                     │ after stimulusTimeout
+                                     v
+                                  response ──CANVAS_CLICK/KEYPRESS──> done
+                                     │
+                                     │ after trialTimeout
+                                     v
+                                   done
+```
+
+**Events:**
+- `CANVAS_CLICK` — `{ type: 'CANVAS_CLICK'; x: number; y: number; timestamp: number }`
+- `KEYPRESS` — `{ type: 'KEYPRESS'; key: string; timestamp: number }`
+
+**Context render phase:**
+
+The machine exposes a `renderPhase` field in context that tells the renderer what to draw:
+
+| Phase | Description |
+|---|---|
+| `'idle'` | Initial state before anything is drawn |
+| `'fixation'` | Draw fixation cross |
+| `'stimulus'` | Draw stimulus (your custom rendering function) |
+| `'blank'` | Clear the canvas (post-stimulus, waiting for response) |
+
+**Output:**
+
+| Field | Type | Description |
+|---|---|---|
+| `canvasSize` | `[number, number]` | The canvas dimensions |
+| `response` | `CanvasResponseData \| null` | Click or key response data |
+| `rt` | `number \| null` | Response time in ms |
+
+**Usage:**
+```ts
+const trial = createCanvasTrialMachine({
+  canvasSize: [800, 600],
+  fixationDuration: 500,
+  stimulusDuration: 200,  // Brief presentation
+  backgroundColor: '#808080',
+});
+```
+
+<Aside type="tip">
+The canvas machine does not draw anything itself. It manages timing and state transitions. Your rendering code subscribes to the machine and reads `context.renderPhase` to decide what to draw on the canvas. This separation lets you use Canvas 2D, WebGL, or PixiJS for the actual drawing.
+</Aside>
+
+---
+
+## plugin-survey
+
+Survey and questionnaire trial with validation. Supports text input, Likert scales, and multiple choice.
+
+**Install:**
+```bash
+pnpm add @xstate-experiments/plugin-survey
+```
+
+**Import:**
+```ts
+import { createSurveyTrialMachine } from '@xstate-experiments/plugin-survey';
+```
+
+### `createSurveyTrialMachine(config)`
+
+**Config:**
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `questions` | `SurveyQuestion[]` | — | Array of question definitions |
+| `presentationMode` | `'all' \| 'sequential'` | `'all'` | Show all questions at once or one at a time |
+| `submitLabel` | `string` | `'Continue'` | Text for the submit button |
+
+**SurveyQuestion:**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `prompt` | `string` | — | The question text |
+| `type` | `'text' \| 'likert' \| 'multi-choice'` | — | Input type |
+| `options` | `string[]` | `undefined` | Available options (required for `likert` and `multi-choice`) |
+| `required` | `boolean` | `true` | Whether the question must be answered |
+
+**Statechart:**
+```
+presenting ──always──> responding ──SUBMIT──> validating
+                          ^                       │
+                          │              ┌────────┴────────┐
+                          │              │                 │
+                     (errors)       allValid          hasErrors
+                          │              │                 │
+                          └──────────────┘                 v
+                                                         done
+```
+
+**Events:**
+- `ANSWER` — `{ type: 'ANSWER'; questionIndex: number; value: string }`
+- `SUBMIT` — `{ type: 'SUBMIT' }`
+- `NEXT_QUESTION` — advance to next question (sequential mode)
+- `PREV_QUESTION` — go back to previous question (sequential mode)
+
+**Output:**
+
+| Field | Type | Description |
+|---|---|---|
+| `answers` | `SurveyAnswer[]` | Array of `{ questionIndex, prompt, type, value }` |
+| `rt` | `number \| null` | Total time from first display to submission |
+
+**Usage:**
+```ts
+const demographicsSurvey = createSurveyTrialMachine({
+  questions: [
+    { prompt: 'What is your age?', type: 'text' },
+    {
+      prompt: 'How comfortable are you with computers?',
+      type: 'likert',
+      options: ['Not at all', 'Slightly', 'Moderately', 'Very', 'Extremely'],
+    },
+    {
+      prompt: 'Which hand do you use for the mouse?',
+      type: 'multi-choice',
+      options: ['Left', 'Right', 'Either'],
+    },
+  ],
+  submitLabel: 'Next',
+});
+```
+
+---
+
+## plugin-instructions
+
+Multi-page instruction display with keyboard and button navigation.
+
+**Install:**
+```bash
+pnpm add @xstate-experiments/plugin-instructions
+```
+
+**Import:**
+```ts
+import { createInstructionsMachine } from '@xstate-experiments/plugin-instructions';
+```
+
+### `createInstructionsMachine(config)`
+
+**Config:**
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `pages` | `string[]` | — | Array of HTML strings, one per instruction page |
+| `allowBackward` | `boolean` | `true` | Whether the participant can navigate backward |
+| `showPageNumbers` | `boolean` | `true` | Whether to display "Page X of Y" |
+| `nextKey` | `string` | `'ArrowRight'` | Key to advance pages |
+| `prevKey` | `string` | `'ArrowLeft'` | Key to go back |
+
+**Statechart:**
+```
+showing ──NEXT(last page)──> done
+   │ ^
+   │ │
+   │ NEXT(not last) / goToNextPage
+   │ PREV(not first) / goToPrevPage
+   │ KEYPRESS(nextKey) / mapped to NEXT
+   │ KEYPRESS(prevKey) / mapped to PREV
+   └─┘
+```
+
+**Events:**
+- `NEXT` — advance to the next page (or complete if on last page)
+- `PREV` — go back to the previous page (if allowed and not on first page)
+- `KEYPRESS` — `{ type: 'KEYPRESS'; key: string; timestamp: number }` — mapped to NEXT/PREV based on configured keys
+
+**Context:**
+
+| Field | Type | Description |
+|---|---|---|
+| `currentPage` | `number` | Zero-based page index |
+| `totalPages` | `number` | Total number of pages |
+| `currentContent` | `string` | HTML content of the current page |
+| `pageViewTimes` | `Record<number, number[]>` | Time spent on each page (supports multiple visits) |
+
+**Output:**
+
+| Field | Type | Description |
+|---|---|---|
+| `rt` | `number \| null` | Total time from first page to completion |
+| `pageViewTimes` | `Record<number, number[]>` | Per-page view durations |
+| `totalPages` | `number` | Number of pages |
+
+**Usage:**
+```ts
+const instructions = createInstructionsMachine({
+  pages: [
+    '<h2>Welcome</h2><p>In this experiment, you will see arrows pointing left or right.</p>',
+    '<h2>Your task</h2><p>Press <kbd>F</kbd> for left arrows and <kbd>J</kbd> for right arrows.</p>',
+    '<h2>Ready?</h2><p>Press the right arrow key to begin.</p>',
+  ],
+  allowBackward: true,
+  nextKey: 'ArrowRight',
+  prevKey: 'ArrowLeft',
+});
+```
+
+<Aside type="note">
+The instructions machine tracks time spent on each page, including multiple visits when the participant navigates backward. This data can be useful for identifying participants who skip instructions too quickly.
+</Aside>
+
+---
+
+## Creating custom plugins
+
+To create a custom trial machine that works with `createExperimentMachine`, follow the [actor contract](/concepts/actors/):
+
+1. Accept input via the `input` property in context initialization
+2. Define internal states (fixation, stimulus, response, etc.)
+3. Handle events with guarded transitions
+4. Reach a `final` state when the trial is complete
+5. Emit typed output from the `output` function
+
+```ts
+import { setup, assign } from 'xstate';
+
+export function createMyTrialMachine(config) {
+  return setup({
+    types: {} as {
+      input: { /* your input type */ };
+      events: { /* your events */ };
+      output: { /* your output type */ };
+      context: { /* your context type */ };
+    },
+    actions: { /* ... */ },
+    guards: { /* ... */ },
+  }).createMachine({
+    id: 'myTrial',
+    initial: 'fixation',
+    context: ({ input }) => ({ /* initialize from input */ }),
+    states: {
+      fixation: { /* ... */ },
+      stimulus: { /* ... */ },
+      response: { /* ... */ },
+      done: { type: 'final' },
+    },
+    output: ({ context }) => ({ /* select output fields */ }),
+  });
+}
+```
+
+The resulting machine can be passed directly to `createExperimentMachine` as the `trialMachine` parameter.

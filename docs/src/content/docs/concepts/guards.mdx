@@ -1,0 +1,360 @@
+---
+title: Guards
+description: Conditional transitions in jsPsych2 — staircases, stopping rules, and adaptive branching as guard logic.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## What are guards?
+
+Guards are conditions attached to transitions. A guarded transition only fires if the guard function returns `true`. If the guard fails, the transition is skipped and the machine checks the next candidate transition (if any).
+
+```ts
+on: {
+  NEXT_TRIAL: [
+    { target: 'active', guard: 'hasMoreTrials' },  // Try this first
+    { target: '#experiment.results' },               // Fallback if guard fails
+  ],
+}
+```
+
+Guards are pure functions. They receive the machine's context and the event that triggered the transition, and return a boolean. They must not produce side effects — no assignments, no DOM manipulation, no network calls.
+
+```ts
+guards: {
+  hasMoreTrials: ({ context }) =>
+    context.currentIndex < context.tasks.length,
+
+  isCorrect: ({ context }) =>
+    context.correct === true,
+
+  validKey: ({ context, event }) =>
+    context.validKeys.includes(event.key),
+}
+```
+
+## Why guards matter for experiments
+
+In traditional experiment frameworks, adaptive logic lives in imperative callbacks. A staircase procedure might look like this in jsPsych:
+
+```js
+// jsPsych approach: external state + callbacks
+let consecutiveCorrect = 0;
+let difficulty = 0.5;
+
+const trial = {
+  type: jsPsychSomething,
+  on_finish: (data) => {
+    if (data.correct) {
+      consecutiveCorrect++;
+      if (consecutiveCorrect >= 3) {
+        difficulty += 0.1;
+        consecutiveCorrect = 0;
+      }
+    } else {
+      consecutiveCorrect = 0;
+      difficulty -= 0.1;
+    }
+  }
+};
+```
+
+This works, but the adaptive logic is buried in a callback, entangled with data recording, invisible to the statechart, and untestable without running the full experiment.
+
+In jsPsych2, the same logic is expressed as guards on transitions:
+
+```ts
+guards: {
+  shouldIncreaseDifficulty: ({ context }) =>
+    context.consecutiveCorrect >= 3,
+
+  shouldDecreaseDifficulty: ({ context }) =>
+    context.consecutiveIncorrect >= 1,
+}
+```
+
+The adaptive logic is visible in the statechart diagram. It can be tested by manipulating context directly. It composes with other guards without callback nesting.
+
+## Adaptive design patterns
+
+### Staircase procedures
+
+A staircase adjusts difficulty based on performance. The transitions between difficulty levels are guarded by performance thresholds:
+
+```ts
+const staircaseMachine = setup({
+  guards: {
+    shouldIncreaseDifficulty: ({ context }) =>
+      context.consecutiveCorrect >= context.staircase.upRule,
+
+    shouldDecreaseDifficulty: ({ context }) =>
+      context.consecutiveIncorrect >= context.staircase.downRule,
+
+    staircaseComplete: ({ context }) =>
+      context.reversals >= context.staircase.maxReversals,
+
+    thresholdReached: ({ context }) =>
+      context.trialsCompleted >= context.staircase.minTrials &&
+      context.reversals >= context.staircase.targetReversals,
+  },
+  actions: {
+    increaseDifficulty: assign(({ context }) => {
+      const wasDecreasing = context.lastDirection === 'down';
+      return {
+        difficulty: context.difficulty + context.staircase.stepSize,
+        lastDirection: 'up' as const,
+        reversals: wasDecreasing
+          ? context.reversals + 1
+          : context.reversals,
+        consecutiveCorrect: 0,
+      };
+    }),
+    decreaseDifficulty: assign(({ context }) => {
+      const wasIncreasing = context.lastDirection === 'up';
+      return {
+        difficulty: context.difficulty - context.staircase.stepSize,
+        lastDirection: 'down' as const,
+        reversals: wasIncreasing
+          ? context.reversals + 1
+          : context.reversals,
+        consecutiveIncorrect: 0,
+      };
+    }),
+  },
+}).createMachine({
+  // ... states use these guards on transitions between trials
+  states: {
+    evaluating: {
+      always: [
+        {
+          target: 'done',
+          guard: 'staircaseComplete',
+        },
+        {
+          target: 'adjustUp',
+          guard: 'shouldIncreaseDifficulty',
+        },
+        {
+          target: 'adjustDown',
+          guard: 'shouldDecreaseDifficulty',
+        },
+        { target: 'nextTrial' },
+      ],
+    },
+    // ...
+  },
+});
+```
+
+The staircase logic is declarative. The guard `staircaseComplete` has priority (listed first), so it always fires before difficulty adjustments. The adjustment guards compose naturally — you can add a `thresholdReached` guard for early stopping without restructuring the callback chain.
+
+### Stopping rules
+
+Stopping rules determine when a block or experiment should end. They are guards on the transition from "run another trial" to "done":
+
+```ts
+guards: {
+  // Fixed trial count
+  maxTrialsReached: ({ context }) =>
+    context.trialsCompleted >= context.maxTrials,
+
+  // Performance-based criterion
+  performanceCriterion: ({ context }) =>
+    context.accuracy >= 0.85 &&
+    context.trialsCompleted >= 20,
+
+  // Time-based limit
+  timeLimitReached: ({ context }) =>
+    performance.now() - context.blockStartTime > context.maxDuration,
+
+  // Combined: any stopping condition met
+  shouldStop: ({ context }) =>
+    context.trialsCompleted >= context.maxTrials ||
+    (context.accuracy >= 0.85 && context.trialsCompleted >= 20),
+}
+```
+
+These guards are evaluated on every `checkNext` transition. The machine's `always` transitions check them in priority order:
+
+```ts
+states: {
+  checkNext: {
+    always: [
+      { target: '#block.done', guard: 'shouldStop' },
+      { target: 'active', guard: 'hasMoreTrials' },
+      { target: '#block.done' }, // fallback: no more trials
+    ],
+  },
+}
+```
+
+### Conditional branching
+
+Guards enable conditional experiment flow based on participant performance. For example, routing to a practice block if accuracy is below threshold:
+
+```ts
+states: {
+  checkPractice: {
+    always: [
+      {
+        target: 'practiceBlock',
+        guard: 'belowPracticeThreshold',
+      },
+      {
+        target: 'mainBlock',
+      },
+    ],
+  },
+}
+```
+
+```ts
+guards: {
+  belowPracticeThreshold: ({ context }) =>
+    context.practiceAccuracy < 0.75,
+}
+```
+
+### Go/No-Go trial logic
+
+The Go/No-Go paradigm is a natural fit for guards. Whether the participant should respond (go) or withhold (no-go) is a guard on what constitutes a correct response:
+
+```ts
+guards: {
+  isGoTrial: ({ context }) => context.trialType === 'go',
+  isNoGoTrial: ({ context }) => context.trialType === 'nogo',
+
+  // Correct if: go trial AND responded, OR nogo trial AND withheld
+  isCorrectResponse: ({ context }) =>
+    (context.trialType === 'go' && context.response !== null) ||
+    (context.trialType === 'nogo' && context.response === null),
+
+  // Timeout: no response within deadline
+  responseTimedOut: () => true, // used as fallback after delay
+}
+```
+
+The trial machine uses these guards to route to the correct evaluation:
+
+```ts
+states: {
+  stimulus: {
+    on: {
+      KEYPRESS: {
+        target: 'evaluation',
+        guard: 'isGoTrial',
+        actions: 'recordResponse',
+      },
+    },
+    after: {
+      responseDeadline: [
+        {
+          target: 'evaluation',
+          // Timeout with no response — could be correct (nogo) or miss (go)
+        },
+      ],
+    },
+  },
+  evaluation: {
+    always: [
+      { target: 'correctFeedback', guard: 'isCorrectResponse' },
+      { target: 'incorrectFeedback' },
+    ],
+  },
+}
+```
+
+<Aside type="tip">
+Guards compose through ordering. Place higher-priority guards first in the transition array. The first guard that returns `true` wins. This replaces nested if/else chains with a flat, readable priority list.
+</Aside>
+
+## Guard composition patterns
+
+### Combining guards
+
+You can compose guards by combining them in a single function:
+
+```ts
+guards: {
+  canAdvanceToNextLevel: ({ context }) =>
+    context.accuracy >= 0.85 &&
+    context.trialsCompleted >= 20 &&
+    context.consecutiveCorrect >= 3,
+}
+```
+
+Or by using multiple guarded transitions:
+
+```ts
+always: [
+  { target: 'done', guard: 'maxTrialsReached' },
+  { target: 'done', guard: 'performanceCriterion' },
+  { target: 'adjustDifficulty', guard: 'shouldAdjust' },
+  { target: 'nextTrial' }, // default fallback
+],
+```
+
+### Parameterized guards
+
+For reusable guard logic, create factory functions:
+
+```ts
+function afterNCorrect(n: number) {
+  return ({ context }: { context: { consecutiveCorrect: number } }) =>
+    context.consecutiveCorrect >= n;
+}
+
+function afterNTrials(n: number) {
+  return ({ context }: { context: { trialsCompleted: number } }) =>
+    context.trialsCompleted >= n;
+}
+
+// Usage in machine setup:
+guards: {
+  practiceComplete: afterNCorrect(5),
+  blockComplete: afterNTrials(40),
+}
+```
+
+## Testing guards
+
+Because guards are pure functions, they are trivially testable:
+
+```ts
+import { describe, it, expect } from 'vitest';
+
+describe('staircase guards', () => {
+  it('should increase difficulty after 3 consecutive correct', () => {
+    const guard = ({ context }) => context.consecutiveCorrect >= 3;
+    expect(guard({ context: { consecutiveCorrect: 2 } })).toBe(false);
+    expect(guard({ context: { consecutiveCorrect: 3 } })).toBe(true);
+  });
+
+  it('should complete after 8 reversals', () => {
+    const guard = ({ context }) => context.reversals >= 8;
+    expect(guard({ context: { reversals: 7 } })).toBe(false);
+    expect(guard({ context: { reversals: 8 } })).toBe(true);
+  });
+});
+```
+
+You can also test guard behavior in the context of a running machine by sending events and checking which state the machine transitions to:
+
+```ts
+import { createActor } from 'xstate';
+
+it('routes to practice when accuracy is below threshold', () => {
+  const actor = createActor(blockMachine, {
+    input: { practiceAccuracy: 0.6 },
+  });
+  actor.start();
+  // ... advance to checkPractice state ...
+  expect(actor.getSnapshot().matches('practiceBlock')).toBe(true);
+});
+```
+
+## Further reading
+
+- [Actions](/concepts/actions/) — what happens after a guard allows a transition
+- [Adaptive Designs guide](/guides/adaptive-designs/) — full walkthrough of staircase and stopping rule implementations
+- [Go/No-Go example](/examples/go-nogo/) — complete Go/No-Go implementation using guards

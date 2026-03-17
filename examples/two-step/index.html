@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Two-Step Task — jsPsych2</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #eee; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+    #app { max-width: 900px; width: 100%; padding: 2rem; text-align: center; }
+
+    /* Shared screen layout */
+    .screen { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 60vh; gap: 1.5rem; }
+
+    /* Instructions */
+    .instructions-screen h1 { font-size: 2rem; color: #7dd3fc; }
+    .instructions-text { font-size: 1.1rem; line-height: 1.7; max-width: 600px; text-align: left; white-space: pre-line; }
+
+    /* Trial counter */
+    .trial-counter { font-size: 0.9rem; color: #888; position: absolute; top: 1rem; right: 1.5rem; }
+
+    /* Fixation cross */
+    .fixation-cross { font-size: 4rem; font-weight: bold; color: #888; }
+
+    /* Prompt text */
+    .prompt { font-size: 1.3rem; color: #ccc; }
+
+    /* Choice row */
+    .choice-row { display: flex; gap: 2rem; justify-content: center; }
+
+    /* Choice boxes */
+    .choice-box {
+      width: 160px; height: 160px;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: transform 0.1s, box-shadow 0.1s;
+      gap: 0.5rem;
+    }
+    .choice-box:hover { transform: scale(1.05); box-shadow: 0 0 20px rgba(255,255,255,0.15); }
+    .choice-label { font-size: 1.2rem; font-weight: 600; }
+    .choice-key { font-size: 0.85rem; color: rgba(255,255,255,0.5); }
+
+    /* Rockets */
+    .rocket-0 { background: #3b82f6; border: 3px solid #60a5fa; }
+    .rocket-1 { background: #f97316; border: 3px solid #fb923c; }
+
+    /* Planet options */
+    .planet-option { background: #1e1e3a; border: 3px solid currentColor; }
+
+    /* Planet label above stage2 options */
+    .planet-label { font-size: 1.8rem; font-weight: bold; }
+
+    /* Transition message */
+    .travel-message { font-size: 1.8rem; font-weight: bold; }
+
+    /* Feedback */
+    .feedback-text { font-size: 2.5rem; font-weight: 600; }
+    .reward-total { font-size: 1.1rem; color: #888; }
+
+    /* ITI blank screen */
+    .iti-screen { min-height: 60vh; }
+
+    /* Results */
+    .results-screen h1 { font-size: 2rem; color: #7dd3fc; }
+    .section-heading { font-size: 1.3rem; color: #7dd3fc; margin-top: 1.5rem; }
+    .debrief-text { font-size: 1rem; line-height: 1.6; max-width: 600px; text-align: left; margin-bottom: 1rem; }
+    .results-table { border-collapse: collapse; margin: 1rem auto; }
+    .results-table th, .results-table td { padding: 0.6rem 1.2rem; border: 1px solid #444; text-align: left; }
+    .results-table th { background: #2a2a4e; color: #7dd3fc; }
+    .results-table td { background: #1e1e3a; }
+    .diagnostic-note { font-size: 0.9rem; color: #888; max-width: 500px; line-height: 1.5; margin-top: 0.5rem; }
+
+    /* Button */
+    .btn { display: inline-block; padding: 0.8rem 2rem; font-size: 1.1rem; border: none; border-radius: 6px; background: #7dd3fc; color: #1a1a2e; cursor: pointer; font-weight: 600; transition: background 0.15s; text-decoration: none; }
+    .btn:hover { background: #38bdf8; }
+    .download-btn { margin-top: 1.5rem; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

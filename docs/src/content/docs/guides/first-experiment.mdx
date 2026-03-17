@@ -1,0 +1,447 @@
+---
+title: Your First Experiment
+description: Build a complete keyboard reaction time experiment from scratch — trial machine, experiment machine, headless tests, and browser rendering.
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+This tutorial walks through building a keyboard reaction time task from scratch. By the end, you will have a trial machine, an experiment machine that invokes it, headless tests, and a browser renderer.
+
+## What we are building
+
+A simple arrow direction task:
+- Show a fixation cross (500ms)
+- Show a left or right arrow
+- Participant presses `F` for left, `J` for right
+- Show correctness feedback (1000ms)
+- Repeat for 8 trials
+- Display results
+
+## Prerequisites
+
+You need a project with `xstate` and `@xstate-experiments/core` installed. See [Getting Started](/getting-started/) for installation.
+
+<Steps>
+
+1. ### Define the trial machine
+
+   The trial machine describes a single trial's lifecycle. It is a standalone statechart that receives stimulus parameters as input and emits response data as output.
+
+   Create `src/trial.ts`:
+
+   ```ts
+   import { setup, assign } from 'xstate';
+
+   export interface ArrowTrialInput {
+     stimulus: '←' | '→';
+     correctKey: 'f' | 'j';
+   }
+
+   export interface ArrowTrialOutput {
+     stimulus: string;
+     response: string;
+     rt: number;
+     correct: boolean;
+   }
+
+   export const arrowTrialMachine = setup({
+     types: {} as {
+       context: {
+         stimulus: string;
+         correctKey: string;
+         validKeys: string[];
+         response: string | null;
+         rt: number | null;
+         correct: boolean | null;
+         stimulusOnsetTime: number | null;
+         fixationDuration: number;
+         feedbackDuration: number;
+       };
+       input: ArrowTrialInput;
+       events: { type: 'KEYPRESS'; key: string; timestamp: number };
+       output: ArrowTrialOutput;
+     },
+     actions: {
+       recordStimulusOnset: assign({
+         stimulusOnsetTime: () => performance.now(),
+       }),
+       recordResponse: assign(({ context, event }) => ({
+         response: event.key,
+         rt: event.timestamp - (context.stimulusOnsetTime ?? event.timestamp),
+         correct: event.key === context.correctKey,
+       })),
+     },
+     guards: {
+       validKey: ({ context, event }) =>
+         context.validKeys.includes(event.key),
+     },
+     delays: {
+       fixation: ({ context }) => context.fixationDuration,
+       feedback: ({ context }) => context.feedbackDuration,
+     },
+   }).createMachine({
+     id: 'arrowTrial',
+     initial: 'fixation',
+     context: ({ input }) => ({
+       stimulus: input.stimulus,
+       correctKey: input.correctKey,
+       validKeys: ['f', 'j'],
+       response: null,
+       rt: null,
+       correct: null,
+       stimulusOnsetTime: null,
+       fixationDuration: 500,
+       feedbackDuration: 1000,
+     }),
+     states: {
+       fixation: {
+         after: { fixation: 'stimulus' },
+       },
+       stimulus: {
+         entry: 'recordStimulusOnset',
+         on: {
+           KEYPRESS: {
+             target: 'feedback',
+             guard: 'validKey',
+             actions: 'recordResponse',
+           },
+         },
+       },
+       feedback: {
+         after: { feedback: 'done' },
+       },
+       done: { type: 'final' },
+     },
+     output: ({ context }) => ({
+       stimulus: context.stimulus,
+       response: context.response!,
+       rt: context.rt!,
+       correct: context.correct!,
+     }),
+   });
+   ```
+
+   The statechart for this trial:
+
+   ```
+   [fixation] --after 500ms--> [stimulus] --KEYPRESS(valid)--> [feedback] --after 1000ms--> [done]
+   ```
+
+   Key design decisions:
+   - The `validKey` guard ignores keypresses that are not `f` or `j`.
+   - `recordStimulusOnset` runs as an entry action, ensuring the timestamp is captured the moment the stimulus state is entered.
+   - `recordResponse` uses the event's timestamp (from the DOM event) for accurate RT.
+
+2. ### Create the experiment machine
+
+   Use `createExperimentMachine` from `@xstate-experiments/core` to orchestrate the trial sequence.
+
+   Create `src/experiment.ts`:
+
+   ```ts
+   import { createExperimentMachine } from '@xstate-experiments/core';
+   import { arrowTrialMachine } from './trial';
+
+   // Define the trial sequence
+   const tasks = [
+     { stimulus: '←' as const, correctKey: 'f' as const },
+     { stimulus: '→' as const, correctKey: 'j' as const },
+     { stimulus: '←' as const, correctKey: 'f' as const },
+     { stimulus: '→' as const, correctKey: 'j' as const },
+     { stimulus: '→' as const, correctKey: 'j' as const },
+     { stimulus: '←' as const, correctKey: 'f' as const },
+     { stimulus: '→' as const, correctKey: 'j' as const },
+     { stimulus: '←' as const, correctKey: 'f' as const },
+   ];
+
+   export const experimentMachine = createExperimentMachine({
+     id: 'arrowRT',
+     tasks,
+     trialMachine: arrowTrialMachine,
+   });
+   ```
+
+   The experiment machine will:
+   1. Start in `instructions` state
+   2. On `START` event, transition to `runningTrials.active`
+   3. Invoke `arrowTrialMachine` for each task, passing `{ task, taskIndex }` as input
+   4. Collect output from each trial into `context.responses`
+   5. After all trials, transition to `results` (final state)
+
+3. ### Write headless tests
+
+   The trial and experiment machines can be tested without a browser. No DOM, no simulated keypresses, no timing workarounds.
+
+   Create `src/experiment.test.ts`:
+
+   ```ts
+   import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+   import { createActor } from 'xstate';
+   import { arrowTrialMachine } from './trial';
+   import { experimentMachine } from './experiment';
+
+   describe('arrowTrialMachine', () => {
+     beforeEach(() => {
+       vi.useFakeTimers();
+     });
+     afterEach(() => {
+       vi.useRealTimers();
+     });
+
+     it('starts in fixation state', () => {
+       const actor = createActor(arrowTrialMachine, {
+         input: { stimulus: '←', correctKey: 'f' },
+       });
+       actor.start();
+       expect(actor.getSnapshot().value).toBe('fixation');
+     });
+
+     it('transitions to stimulus after fixation delay', () => {
+       const actor = createActor(arrowTrialMachine, {
+         input: { stimulus: '←', correctKey: 'f' },
+       });
+       actor.start();
+       vi.advanceTimersByTime(500);
+       expect(actor.getSnapshot().value).toBe('stimulus');
+     });
+
+     it('records correct response', () => {
+       const actor = createActor(arrowTrialMachine, {
+         input: { stimulus: '←', correctKey: 'f' },
+       });
+       actor.start();
+       vi.advanceTimersByTime(500); // past fixation
+
+       actor.send({
+         type: 'KEYPRESS',
+         key: 'f',
+         timestamp: performance.now(),
+       });
+
+       const snap = actor.getSnapshot();
+       expect(snap.value).toBe('feedback');
+       expect(snap.context.correct).toBe(true);
+       expect(snap.context.response).toBe('f');
+     });
+
+     it('ignores invalid keys', () => {
+       const actor = createActor(arrowTrialMachine, {
+         input: { stimulus: '←', correctKey: 'f' },
+       });
+       actor.start();
+       vi.advanceTimersByTime(500);
+
+       actor.send({
+         type: 'KEYPRESS',
+         key: 'x',
+         timestamp: performance.now(),
+       });
+
+       // Should still be in stimulus — invalid key was ignored
+       expect(actor.getSnapshot().value).toBe('stimulus');
+     });
+
+     it('emits typed output on completion', () => {
+       const actor = createActor(arrowTrialMachine, {
+         input: { stimulus: '→', correctKey: 'j' },
+       });
+       actor.start();
+       vi.advanceTimersByTime(500);
+       actor.send({ type: 'KEYPRESS', key: 'j', timestamp: performance.now() });
+       vi.advanceTimersByTime(1000); // past feedback
+
+       const snap = actor.getSnapshot();
+       expect(snap.status).toBe('done');
+       expect(snap.output).toEqual(expect.objectContaining({
+         stimulus: '→',
+         response: 'j',
+         correct: true,
+       }));
+     });
+   });
+
+   describe('experimentMachine', () => {
+     it('starts in instructions state', () => {
+       const actor = createActor(experimentMachine);
+       actor.start();
+       expect(actor.getSnapshot().value).toBe('instructions');
+     });
+
+     it('transitions to running trials on START', () => {
+       const actor = createActor(experimentMachine);
+       actor.start();
+       actor.send({ type: 'START' });
+       expect(actor.getSnapshot().value).toEqual({
+         runningTrials: 'active',
+       });
+     });
+   });
+   ```
+
+   Run with:
+   ```bash
+   pnpm vitest run
+   ```
+
+4. ### Add keyboard input
+
+   In the browser, you need to forward DOM keyboard events to the trial actor. The `keyboardInput` actor from `@xstate-experiments/core` does this automatically, but for fine-grained control you can forward events manually.
+
+   Create `src/main.ts`:
+
+   ```ts
+   import { createActor } from 'xstate';
+   import { experimentMachine } from './experiment';
+
+   const app = document.getElementById('app')!;
+   const actor = createActor(experimentMachine, {
+     inspect: (event) => {
+       if (event.type === '@xstate.snapshot') {
+         requestAnimationFrame(() => render());
+       }
+     },
+   });
+
+   // Forward keyboard events to the trial actor
+   document.addEventListener('keydown', (e) => {
+     const trial = actor.getSnapshot().children.currentTrial;
+     if (trial) {
+       trial.send({
+         type: 'KEYPRESS',
+         key: e.key,
+         timestamp: performance.now(),
+       });
+     }
+   });
+
+   function render() {
+     const snap = actor.getSnapshot();
+
+     if (snap.matches('instructions')) {
+       app.innerHTML = `
+         <div class="instructions">
+           <h1>Arrow Direction Task</h1>
+           <p>Press <kbd>F</kbd> for left arrows, <kbd>J</kbd> for right arrows.</p>
+           <p>Respond as quickly and accurately as you can.</p>
+           <button id="start">Begin</button>
+         </div>
+       `;
+       document.getElementById('start')!.onclick = () =>
+         actor.send({ type: 'START' });
+       return;
+     }
+
+     if (snap.matches({ runningTrials: 'active' })) {
+       const trial = snap.children.currentTrial;
+       if (!trial) return;
+       const ts = trial.getSnapshot();
+
+       if (ts.matches('fixation')) {
+         app.innerHTML = '<div class="fixation">+</div>';
+       } else if (ts.matches('stimulus')) {
+         app.innerHTML = `<div class="stimulus">${ts.context.stimulus}</div>`;
+       } else if (ts.matches('feedback')) {
+         const label = ts.context.correct ? 'Correct!' : 'Incorrect';
+         const cls = ts.context.correct ? 'correct' : 'incorrect';
+         app.innerHTML = `<div class="feedback ${cls}">${label}</div>`;
+       }
+       return;
+     }
+
+     if (snap.status === 'done') {
+       const responses = snap.context.responses as Array<{
+         stimulus: string;
+         response: string;
+         rt: number;
+         correct: boolean;
+       }>;
+       const correct = responses.filter((r) => r.correct).length;
+       const meanRT = responses.reduce((s, r) => s + r.rt, 0) / responses.length;
+
+       app.innerHTML = `
+         <div class="results">
+           <h1>Results</h1>
+           <p>${correct} / ${responses.length} correct</p>
+           <p>Mean RT: ${meanRT.toFixed(0)} ms</p>
+           <table>
+             <thead><tr><th>Trial</th><th>Stimulus</th><th>Response</th><th>RT</th><th>Correct</th></tr></thead>
+             <tbody>
+               ${responses.map((r, i) => `
+                 <tr>
+                   <td>${i + 1}</td>
+                   <td>${r.stimulus}</td>
+                   <td>${r.response}</td>
+                   <td>${r.rt.toFixed(0)} ms</td>
+                   <td>${r.correct ? 'Yes' : 'No'}</td>
+                 </tr>
+               `).join('')}
+             </tbody>
+           </table>
+           <button onclick="location.reload()">Run Again</button>
+         </div>
+       `;
+       return;
+     }
+   }
+
+   actor.start();
+   render();
+   ```
+
+5. ### Add the HTML shell
+
+   Create `index.html`:
+
+   ```html
+   <!DOCTYPE html>
+   <html lang="en">
+   <head>
+     <meta charset="UTF-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>Arrow Direction Task</title>
+     <style>
+       body { font-family: system-ui; background: #1a1a2e; color: #eee; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+       #app { text-align: center; max-width: 600px; }
+       .fixation { font-size: 4rem; }
+       .stimulus { font-size: 6rem; }
+       .feedback.correct { color: #4caf50; font-size: 2rem; }
+       .feedback.incorrect { color: #f44336; font-size: 2rem; }
+       button { padding: 12px 24px; font-size: 1.1rem; cursor: pointer; border: none; border-radius: 6px; background: #7FDBFF; color: #1a1a2e; margin-top: 1rem; }
+       kbd { background: #333; padding: 2px 8px; border-radius: 4px; font-family: monospace; }
+       table { margin: 1rem auto; border-collapse: collapse; }
+       th, td { padding: 6px 14px; border: 1px solid #444; }
+     </style>
+   </head>
+   <body>
+     <div id="app"></div>
+     <script type="module" src="./src/main.ts"></script>
+   </body>
+   </html>
+   ```
+
+   Run with any dev server (Vite, etc.):
+   ```bash
+   pnpm vite
+   ```
+
+</Steps>
+
+## What you built
+
+You now have:
+
+| Layer | File | Responsibility |
+|---|---|---|
+| Trial logic | `src/trial.ts` | Single trial statechart: fixation, stimulus, response, feedback |
+| Experiment orchestration | `src/experiment.ts` | Invokes trial actors in sequence, collects results |
+| Headless tests | `src/experiment.test.ts` | Verifies machine logic without a browser |
+| Browser rendering | `src/main.ts` | Subscribes to state changes, renders DOM |
+
+Each layer is independent. You can swap the trial machine for a different paradigm without changing the experiment machine. You can replace the DOM renderer with React or Lit without touching the trial logic. You can test everything without a browser.
+
+## Next steps
+
+- Add a [staircase procedure](/guides/adaptive-designs/) to adjust difficulty
+- Add a data collection actor for [persistent storage](/api/core/#data-collector)
+- Build a [Go/No-Go variant](/examples/go-nogo/) using guards
+- Read about [porting from jsPsych](/guides/porting-from-jspsych/) if you have existing experiments

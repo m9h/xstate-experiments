@@ -1,33 +1,31 @@
 {
-  "name": "jspsych2",
-  "version": "1.0.0",
-  "description": "**Behavioral experiment framework built on statecharts and the actor model.**",
-  "main": "index.js",
-  "directories": {
-    "doc": "docs"
-  },
+  "name": "jsPsych2",
+  "private": true,
+  "description": "Behavioral experiment framework built on statecharts and the actor model",
   "scripts": {
-    "test": "vitest run",
+    "build": "turbo build",
+    "test": "turbo test",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/m9h/jsPsych2.git"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/m9h/jsPsych2/issues"
-  },
-  "homepage": "https://github.com/m9h/jsPsych2#readme",
-  "dependencies": {
-    "xstate": "^5.28.0"
+    "typecheck": "turbo typecheck",
+    "dev": "turbo dev",
+    "lint": "eslint .",
+    "format": "prettier --write ."
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
-    "typescript": "^5.9.3",
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
+    "prettier": "^3.4.0",
+    "turbo": "^2.0.0",
+    "typescript": "^5.9.0",
     "vitest": "^4.1.0"
+  },
+  "packageManager": "pnpm@10.32.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xstate-experiments/jsPsych2.git"
+  },
+  "license": "MIT",
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
   }
 }

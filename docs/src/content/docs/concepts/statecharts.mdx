@@ -1,0 +1,216 @@
+---
+title: Statecharts
+description: How statecharts map to behavioral experiments — states, transitions, events, and hierarchy.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## What is a statechart?
+
+A statechart is an extension of finite state machines introduced by David Harel in 1987. Where a basic state machine has states and transitions, a statechart adds:
+
+- **Hierarchy** — states can contain sub-states (nested machines)
+- **Parallelism** — multiple regions can be active simultaneously
+- **Guards** — conditions that must be true for a transition to fire
+- **Actions** — side effects that run on entry, exit, or during transitions
+- **Delayed transitions** — transitions that fire after a specified duration
+
+These additions make statecharts expressive enough to model real experiment protocols without losing the formal guarantees of state machines.
+
+## Experiments are statecharts
+
+Every behavioral experiment has the same fundamental structure:
+
+1. Present a stimulus (enter a state)
+2. Wait for a response (remain in that state until an event arrives)
+3. Evaluate the response (transition logic with guards)
+4. Record data (side effect via actions)
+5. Decide what comes next (conditional transition)
+
+In jsPsych2, this is not a metaphor. The experiment literally _is_ a statechart, executed by the XState v5 runtime.
+
+## States, transitions, events
+
+### States
+
+A state represents a phase of the experiment. States are not "doing something" — they describe what the experiment _is right now_. A trial might have these states:
+
+```
+fixation — showing a fixation cross, waiting for a timer
+stimulus — showing the stimulus, waiting for input
+response — processing the input
+feedback — showing the result
+done     — final state, trial complete
+```
+
+### Transitions
+
+A transition moves the machine from one state to another. Transitions are triggered by events or by time:
+
+```ts
+states: {
+  fixation: {
+    // Delayed transition: after 500ms, move to 'stimulus'
+    after: { 500: 'stimulus' },
+  },
+  stimulus: {
+    on: {
+      // Event-driven transition: on KEYPRESS, move to 'feedback'
+      KEYPRESS: { target: 'feedback', guard: 'validKey' },
+    },
+  },
+}
+```
+
+### Events
+
+Events are the inputs to the statechart. They represent things that happen in the world: a key was pressed, a mouse was clicked, a timer expired. Events are plain objects with a `type` field and optional payload:
+
+```ts
+{ type: 'KEYPRESS', key: 'f', timestamp: 1234567890.123 }
+{ type: 'SUBMIT_GRID', grid: [[0, 1], [1, 0]] }
+{ type: 'CHOOSE', arm: 0 }
+```
+
+The machine only responds to events that have defined transitions in the current state. A `KEYPRESS` event sent during the `fixation` state is ignored — no error, no side effect. This is not a bug; it is the formalism protecting you from impossible state transitions.
+
+## How experiments map to statecharts
+
+### The three-level hierarchy
+
+jsPsych2 uses a three-level hierarchy that mirrors the natural structure of behavioral experiments:
+
+```
+Experiment Machine
+├── instructions
+├── runningTrials
+│   ├── active (invokes current block/trial actor)
+│   └── checkNext (guard: hasMoreTasks?)
+├── debriefing
+└── results (final state)
+    └── output: all collected data
+
+Block Machine (invoked by experiment)
+├── blockInstructions
+├── trials
+│   ├── active (invokes current trial actor)
+│   └── checkNext (guard: hasMoreTrials?)
+├── blockFeedback
+└── done (final state)
+    └── output: block-level results
+
+Trial Machine (invoked by block)
+├── fixation
+├── stimulus
+├── response
+├── evaluation
+├── feedback
+└── done (final state)
+    └── output: { response, rt, correct, ... }
+```
+
+Each level is a complete statechart that knows nothing about its parent or children. Communication happens exclusively through **inputs** (parent to child) and **outputs** (child to parent via final state).
+
+### Hierarchical states
+
+States can contain sub-states. The `runningTrials` state has its own internal machine:
+
+```ts
+states: {
+  runningTrials: {
+    initial: 'active',
+    states: {
+      active: {
+        invoke: {
+          id: 'currentTrial',
+          src: 'trialMachine',
+          input: ({ context }) => ({
+            task: context.tasks[context.currentIndex],
+            taskIndex: context.currentIndex,
+          }),
+          onDone: {
+            target: 'checkNext',
+            actions: 'collectResult',
+          },
+        },
+      },
+      checkNext: {
+        always: [
+          { target: 'active', guard: 'hasMoreTasks' },
+          { target: '#experiment.results' },
+        ],
+      },
+    },
+  },
+}
+```
+
+When the experiment is in the `runningTrials.active` state, it is simultaneously in the `runningTrials` parent state and the `active` child state. The child trial machine is running as an invoked actor. When the trial reaches its final state, the `onDone` transition fires, collecting the result and checking whether to invoke the next trial.
+
+## A trial as a statechart
+
+Here is a complete keyboard response trial as a state diagram:
+
+```
+                       after 500ms
+  [fixation] ─────────────────────> [stimulus]
+                                       │
+                                       │ KEYPRESS (guard: validKey)
+                                       │ actions: recordResponse
+                                       v
+                                    [feedback]
+                                       │
+                                       │ after 1000ms
+                                       v
+                                     [done]
+                                       │
+                                       └── output: { response, rt, correct }
+```
+
+Every aspect of the trial is visible in this diagram:
+- **fixation** lasts exactly 500ms (delayed transition)
+- **stimulus** waits indefinitely for a valid keypress (guarded event transition)
+- **feedback** lasts 1000ms, then the trial ends
+- The **output** is structured data emitted when the machine reaches its final state
+
+<Aside type="tip">
+Paste any jsPsych2 machine definition into the [Stately Visualizer](https://stately.ai/viz) to get an interactive statechart diagram. You can step through states, send events, and inspect context — all without running the experiment.
+</Aside>
+
+## Parallel states
+
+Statecharts support parallel regions — multiple sub-states that are active simultaneously. jsPsych2 uses this for background processes:
+
+```
+experiment (type: parallel)
+├── session (the main sequential flow)
+│   ├── instructions
+│   ├── runningTrials
+│   └── results
+├── dataCollector (background actor)
+│   └── buffers data, flushes to server
+└── timingMonitor (background actor)
+    └── tracks frame drops, flags issues
+```
+
+The timing monitor runs a `requestAnimationFrame` loop alongside the main experiment flow. The data collector buffers trial results and flushes them to a backend. Neither blocks the trial sequence. Neither can interfere with the experiment's state transitions.
+
+## Formal properties
+
+Because experiments are statecharts, they inherit formal properties that are impossible with ad-hoc implementations:
+
+**Determinism.** Given a state and an event, the next state is always deterministic (guards resolve ambiguity). Two runs with identical event sequences produce identical state histories.
+
+**Reachability.** You can verify that every state in the machine is reachable from the initial state. An unreachable state means a dead branch in your experiment.
+
+**Completeness.** You can check that every state handles every expected event. Missing transitions are explicit — the machine ignores unhandled events rather than crashing.
+
+**Serializability.** The machine configuration is a plain JavaScript object. You can serialize it as JSON, diff it between versions, and programmatically generate variants.
+
+## Further reading
+
+- [Actors](/concepts/actors/) — how trial types are composed as invoked actors
+- [Guards](/concepts/guards/) — conditional logic for adaptive designs
+- [Actions](/concepts/actions/) — side effects, timing, and data recording
+- [XState v5 Documentation](https://stately.ai/docs/xstate) — the underlying runtime
+- David Harel (1987). "Statecharts: A Visual Formalism for Complex Systems." _Science of Computer Programming_.

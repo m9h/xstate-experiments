@@ -1,0 +1,374 @@
+---
+title: Adaptive Designs
+description: Build staircase procedures, stopping rules, and conditional branching using guards and context.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Adaptive experiment designs adjust their behavior based on the participant's performance. In traditional frameworks, this requires external state variables and imperative callback logic. In jsPsych2, adaptive logic is expressed declaratively as guards on transitions.
+
+## Staircase procedures
+
+A staircase procedure adjusts stimulus difficulty to find a perceptual threshold. The classic 1-up/3-down staircase increases difficulty after 3 consecutive correct responses and decreases it after 1 incorrect response, tracking reversals to estimate threshold.
+
+### Machine design
+
+The staircase operates at the block level. After each trial completes, the block machine evaluates whether to adjust difficulty, continue, or stop.
+
+```ts
+import { setup, assign } from 'xstate';
+
+interface StaircaseContext {
+  difficulty: number;
+  stepSize: number;
+  minDifficulty: number;
+  maxDifficulty: number;
+  consecutiveCorrect: number;
+  upRule: number;        // correct responses needed to increase difficulty
+  downRule: number;      // incorrect responses needed to decrease difficulty
+  reversals: number;
+  maxReversals: number;
+  lastDirection: 'up' | 'down' | null;
+  trialsCompleted: number;
+  trialResults: Array<{ correct: boolean; difficulty: number; rt: number }>;
+}
+
+export const staircaseBlockMachine = setup({
+  guards: {
+    shouldIncreaseDifficulty: ({ context }) =>
+      context.consecutiveCorrect >= context.upRule,
+
+    shouldDecreaseDifficulty: ({ context }) =>
+      context.consecutiveCorrect === 0, // just got one wrong
+
+    staircaseComplete: ({ context }) =>
+      context.reversals >= context.maxReversals,
+  },
+  actions: {
+    recordTrialResult: assign(({ context, event }) => {
+      const output = event.output;
+      const results = [...context.trialResults, {
+        correct: output.correct,
+        difficulty: context.difficulty,
+        rt: output.rt,
+      }];
+
+      return {
+        trialResults: results,
+        trialsCompleted: context.trialsCompleted + 1,
+        consecutiveCorrect: output.correct
+          ? context.consecutiveCorrect + 1
+          : 0,
+      };
+    }),
+
+    increaseDifficulty: assign(({ context }) => {
+      const wasDecreasing = context.lastDirection === 'down';
+      return {
+        difficulty: Math.min(
+          context.difficulty + context.stepSize,
+          context.maxDifficulty,
+        ),
+        consecutiveCorrect: 0,
+        lastDirection: 'up' as const,
+        reversals: wasDecreasing
+          ? context.reversals + 1
+          : context.reversals,
+      };
+    }),
+
+    decreaseDifficulty: assign(({ context }) => {
+      const wasIncreasing = context.lastDirection === 'up';
+      return {
+        difficulty: Math.max(
+          context.difficulty - context.stepSize,
+          context.minDifficulty,
+        ),
+        lastDirection: 'down' as const,
+        reversals: wasIncreasing
+          ? context.reversals + 1
+          : context.reversals,
+      };
+    }),
+  },
+}).createMachine({
+  id: 'staircaseBlock',
+  initial: 'runTrial',
+  context: ({ input }) => ({
+    difficulty: input.startDifficulty ?? 0.5,
+    stepSize: input.stepSize ?? 0.05,
+    minDifficulty: input.minDifficulty ?? 0.01,
+    maxDifficulty: input.maxDifficulty ?? 1.0,
+    consecutiveCorrect: 0,
+    upRule: input.upRule ?? 3,
+    downRule: input.downRule ?? 1,
+    reversals: 0,
+    maxReversals: input.maxReversals ?? 8,
+    lastDirection: null,
+    trialsCompleted: 0,
+    trialResults: [],
+  }),
+  states: {
+    runTrial: {
+      invoke: {
+        src: 'trialMachine',
+        input: ({ context }) => ({
+          difficulty: context.difficulty,
+        }),
+        onDone: {
+          target: 'evaluate',
+          actions: 'recordTrialResult',
+        },
+      },
+    },
+    evaluate: {
+      always: [
+        { target: 'done', guard: 'staircaseComplete' },
+        {
+          target: 'adjustUp',
+          guard: 'shouldIncreaseDifficulty',
+        },
+        {
+          target: 'adjustDown',
+          guard: 'shouldDecreaseDifficulty',
+        },
+        { target: 'runTrial' }, // no adjustment needed
+      ],
+    },
+    adjustUp: {
+      entry: 'increaseDifficulty',
+      always: 'runTrial',
+    },
+    adjustDown: {
+      entry: 'decreaseDifficulty',
+      always: 'runTrial',
+    },
+    done: {
+      type: 'final',
+    },
+  },
+  output: ({ context }) => ({
+    threshold: context.difficulty,
+    reversals: context.reversals,
+    trialsCompleted: context.trialsCompleted,
+    trialResults: context.trialResults,
+  }),
+});
+```
+
+### How it works
+
+The `evaluate` state checks guards in priority order:
+
+1. Is the staircase complete (enough reversals)? If so, stop.
+2. Should difficulty increase (enough consecutive correct)? If so, go to `adjustUp`.
+3. Should difficulty decrease (just got one wrong)? If so, go to `adjustDown`.
+4. Otherwise, run another trial at the current difficulty.
+
+The `adjustUp` and `adjustDown` states run their entry actions (which update context) and immediately transition to `runTrial`. This separation makes the staircase logic visible in the statechart diagram — you can see the adjustment paths as distinct states.
+
+### Testing the staircase
+
+```ts
+it('increases difficulty after 3 consecutive correct', () => {
+  const actor = createActor(staircaseBlockMachine, {
+    input: { startDifficulty: 0.5, upRule: 3, stepSize: 0.1 },
+  });
+  actor.start();
+
+  // Simulate 3 correct trials
+  for (let i = 0; i < 3; i++) {
+    // ... advance through trial, send correct response
+  }
+
+  expect(actor.getSnapshot().context.difficulty).toBe(0.6);
+});
+```
+
+## Stopping rules
+
+Stopping rules determine when a block ends. They are guards on the `evaluate` or `checkNext` transition.
+
+### Common stopping rules
+
+```ts
+guards: {
+  // Stop after N trials
+  maxTrialsReached: ({ context }) =>
+    context.trialsCompleted >= context.maxTrials,
+
+  // Stop when accuracy is high enough (minimum trial count)
+  accuracyCriterion: ({ context }) =>
+    context.trialsCompleted >= context.minTrials &&
+    context.correctCount / context.trialsCompleted >= context.accuracyThreshold,
+
+  // Stop after a time limit
+  timeLimitReached: ({ context }) =>
+    performance.now() - context.blockStartTime > context.timeLimitMs,
+
+  // Stop when confidence interval is narrow enough
+  precisionCriterion: ({ context }) => {
+    const p = context.correctCount / context.trialsCompleted;
+    const se = Math.sqrt(p * (1 - p) / context.trialsCompleted);
+    return context.trialsCompleted >= 20 && se < context.precisionThreshold;
+  },
+}
+```
+
+### Combining stopping rules
+
+Multiple stopping rules compose naturally as ordered guards:
+
+```ts
+states: {
+  checkNext: {
+    always: [
+      // Priority order: check stopping conditions first
+      { target: 'done', guard: 'timeLimitReached' },
+      { target: 'done', guard: 'accuracyCriterion' },
+      { target: 'done', guard: 'maxTrialsReached' },
+      // If no stopping condition met, continue
+      { target: 'runTrial' },
+    ],
+  },
+}
+```
+
+The first guard that returns `true` wins. Time limits take priority over accuracy criteria, which take priority over trial counts.
+
+## Conditional branching
+
+Route participants through different experiment paths based on performance.
+
+### Practice-to-main routing
+
+```ts
+states: {
+  practiceBlock: {
+    invoke: {
+      src: 'blockMachine',
+      input: { trials: practiceTrials, showFeedback: true },
+      onDone: {
+        target: 'evaluatePractice',
+        actions: assign({
+          practiceAccuracy: ({ event }) =>
+            event.output.correctCount / event.output.trialsCompleted,
+          practiceAttempts: ({ context }) =>
+            context.practiceAttempts + 1,
+        }),
+      },
+    },
+  },
+  evaluatePractice: {
+    always: [
+      {
+        target: 'mainBlock',
+        guard: 'practicePassedOrMaxAttempts',
+      },
+      {
+        target: 'practiceBlock',
+        guard: 'canRetryPractice',
+      },
+      {
+        target: 'excluded',
+      },
+    ],
+  },
+  mainBlock: { /* ... */ },
+  excluded: {
+    // Participant did not meet practice criteria
+    type: 'final',
+  },
+}
+```
+
+```ts
+guards: {
+  practicePassedOrMaxAttempts: ({ context }) =>
+    context.practiceAccuracy >= 0.75 ||
+    context.practiceAttempts >= 3,
+
+  canRetryPractice: ({ context }) =>
+    context.practiceAccuracy < 0.75 &&
+    context.practiceAttempts < 3,
+}
+```
+
+### Multi-arm experiment routing
+
+Route to different task blocks based on experimental condition:
+
+```ts
+states: {
+  assignCondition: {
+    entry: assign({
+      condition: () => Math.random() < 0.5 ? 'control' : 'experimental',
+    }),
+    always: [
+      { target: 'controlBlock', guard: 'isControl' },
+      { target: 'experimentalBlock' },
+    ],
+  },
+  controlBlock: { /* ... */ },
+  experimentalBlock: { /* ... */ },
+}
+```
+
+## Guard composition patterns
+
+### Parameterized guard factories
+
+Create reusable guards with configurable thresholds:
+
+```ts
+function afterNCorrect(n: number) {
+  return ({ context }: { context: { consecutiveCorrect: number } }) =>
+    context.consecutiveCorrect >= n;
+}
+
+function afterNTrials(n: number) {
+  return ({ context }: { context: { trialsCompleted: number } }) =>
+    context.trialsCompleted >= n;
+}
+
+function accuracyAbove(threshold: number, minTrials = 10) {
+  return ({ context }: { context: { correctCount: number; trialsCompleted: number } }) =>
+    context.trialsCompleted >= minTrials &&
+    context.correctCount / context.trialsCompleted >= threshold;
+}
+
+// Usage:
+guards: {
+  practiceComplete: afterNCorrect(5),
+  blockComplete: afterNTrials(40),
+  performanceCriterion: accuracyAbove(0.85, 20),
+}
+```
+
+<Aside type="tip">
+Parameterized guards are just functions that return guard functions. They have no special API -- they are standard JavaScript closures. This means you can test them in isolation with plain unit tests.
+</Aside>
+
+### Dynamic guard thresholds from context
+
+If thresholds need to change during the experiment (e.g., based on prior block performance), store them in context:
+
+```ts
+guards: {
+  thresholdReached: ({ context }) =>
+    context.correctCount / context.trialsCompleted >= context.currentThreshold,
+}
+
+actions: {
+  adjustThreshold: assign(({ context }) => ({
+    currentThreshold: context.currentThreshold * 0.95, // relax threshold
+  })),
+}
+```
+
+## Further reading
+
+- [Guards](/concepts/guards/) — full reference on guard mechanics
+- [Actions](/concepts/actions/) — how to update context during adaptive adjustments
+- [Go/No-Go example](/examples/go-nogo/) — guard-based trial logic
+- [Reversal Learning example](/examples/reversal-learning/) — dynamic reward contingencies

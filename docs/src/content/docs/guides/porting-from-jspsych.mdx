@@ -1,0 +1,361 @@
+---
+title: Porting from jsPsych
+description: Migration guide from jsPsych v7/v8 to jsPsych2 — concept mapping, before/after comparisons, and step-by-step porting.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Concept mapping
+
+The table below maps jsPsych v7/v8 concepts to their jsPsych2 equivalents. The right column is not a 1:1 replacement — it is the _correct abstraction_ for what the jsPsych concept was approximating.
+
+| jsPsych v7/v8 | jsPsych2 | Notes |
+|---|---|---|
+| Timeline (array of trials) | Experiment machine | Statechart with `runningTrials` state |
+| Nested timeline | Block machine (invoked actor) | Hierarchical statechart |
+| Plugin class | Trial machine (actor) | Statechart with typed input/output |
+| `trial()` method | Machine states + transitions | Fixation, stimulus, response, feedback states |
+| `jsPsych.finishTrial(data)` | Final state with `output` | Data emitted as typed output |
+| `on_start` / `on_finish` | Entry / exit actions | Actions on states |
+| `on_load` | Entry action on first state | No separate "loaded" hook needed |
+| `conditional_function` | Guard on transition | Re-evaluated on every transition attempt |
+| `loop_function` | Guard on `checkNext` transition | `hasMoreTrials` guard |
+| `timeline_variables` | Machine context + input | Task array passed as context |
+| `jsPsych.data` (global store) | Actor output hierarchy | Data flows upward through outputs |
+| `jsPsych.pauseExperiment()` | Parallel state or event | Machine-level pause event |
+| Simulation mode | Headless actor testing | Same machine, no browser needed |
+| Extension | Background actor | Parallel process (data streaming, timing) |
+
+## Before and after
+
+### A basic reaction time trial
+
+**jsPsych v7:**
+
+```js
+const trial = {
+  type: jsPsychHtmlKeyboardResponse,
+  stimulus: '<span style="font-size: 48px;">→</span>',
+  choices: ['f', 'j'],
+  trial_duration: 3000,
+  on_finish: (data) => {
+    data.correct = jsPsych.pluginAPI.compareKeys(data.response, 'j');
+  },
+};
+
+const fixation = {
+  type: jsPsychHtmlKeyboardResponse,
+  stimulus: '+',
+  choices: 'NO_KEYS',
+  trial_duration: 500,
+};
+
+const timeline = [fixation, trial];
+jsPsych.run(timeline);
+```
+
+**jsPsych2:**
+
+```ts
+import { setup, assign } from 'xstate';
+
+const trialMachine = setup({
+  actions: {
+    recordStimulusOnset: assign({
+      stimulusOnsetTime: () => performance.now(),
+    }),
+    recordResponse: assign(({ context, event }) => ({
+      response: event.key,
+      rt: event.timestamp - context.stimulusOnsetTime,
+      correct: event.key === context.correctKey,
+    })),
+  },
+  guards: {
+    validKey: ({ context, event }) =>
+      context.validKeys.includes(event.key),
+  },
+}).createMachine({
+  id: 'rtTrial',
+  initial: 'fixation',
+  context: ({ input }) => ({
+    stimulus: input.stimulus,
+    correctKey: input.correctKey,
+    validKeys: ['f', 'j'],
+    stimulusOnsetTime: null,
+    response: null,
+    rt: null,
+    correct: null,
+  }),
+  states: {
+    fixation: {
+      after: { 500: 'stimulus' },
+    },
+    stimulus: {
+      entry: 'recordStimulusOnset',
+      on: {
+        KEYPRESS: {
+          target: 'done',
+          guard: 'validKey',
+          actions: 'recordResponse',
+        },
+      },
+      after: { 3000: 'done' }, // trial_duration equivalent
+    },
+    done: { type: 'final' },
+  },
+  output: ({ context }) => ({
+    response: context.response,
+    rt: context.rt,
+    correct: context.correct,
+  }),
+});
+```
+
+Key differences:
+- **Fixation is a state**, not a separate trial object. The trial machine owns its own fixation phase.
+- **Correctness is computed in an action**, not a callback. It runs automatically during the transition.
+- **Timeout is a delayed transition**, not a configuration option. If no keypress arrives within 3000ms, the machine transitions to `done` with null response.
+- **Data is structured output**, not a mutated object. The `output` function selects exactly what to emit.
+
+### Conditional branching
+
+**jsPsych v7:**
+
+```js
+let practiceAccuracy = 0;
+
+const practiceBlock = {
+  timeline: [practiceTrials],
+  on_timeline_finish: () => {
+    const data = jsPsych.data.get().filter({ phase: 'practice' });
+    practiceAccuracy = data.select('correct').mean();
+  },
+};
+
+const repeatOrContinue = {
+  conditional_function: () => practiceAccuracy < 0.75,
+  timeline: [practiceBlock],
+};
+
+const mainBlock = { timeline: [mainTrials] };
+const timeline = [practiceBlock, repeatOrContinue, mainBlock];
+```
+
+**jsPsych2:**
+
+```ts
+states: {
+  practiceBlock: {
+    invoke: {
+      src: 'blockMachine',
+      input: { trials: practiceTrials },
+      onDone: {
+        target: 'checkPractice',
+        actions: assign({
+          practiceAccuracy: ({ event }) => event.output.accuracy,
+        }),
+      },
+    },
+  },
+  checkPractice: {
+    always: [
+      {
+        target: 'practiceBlock',
+        guard: ({ context }) => context.practiceAccuracy < 0.75,
+      },
+      { target: 'mainBlock' },
+    ],
+  },
+  mainBlock: {
+    invoke: {
+      src: 'blockMachine',
+      input: { trials: mainTrials },
+      onDone: 'results',
+    },
+  },
+}
+```
+
+The `conditional_function` is replaced by a guard on a transition in the `checkPractice` state. It evaluates every time the machine enters that state — not once when the timeline is parsed. The practice accuracy is stored in machine context, not in a closure variable.
+
+### Timeline variables
+
+**jsPsych v7:**
+
+```js
+const factors = {
+  stimulus: ['←', '→'],
+  congruent: [true, false],
+};
+
+const timeline = {
+  timeline: [trial],
+  timeline_variables: jsPsych.randomization.factorial(factors),
+  randomize_order: true,
+};
+```
+
+**jsPsych2:**
+
+```ts
+import { createExperimentMachine } from '@xstate-experiments/core';
+
+// Generate trial list using standard JS
+const factors = [
+  { stimulus: '←', congruent: true },
+  { stimulus: '←', congruent: false },
+  { stimulus: '→', congruent: true },
+  { stimulus: '→', congruent: false },
+];
+
+// Fisher-Yates shuffle
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+const tasks = shuffle(factors.flatMap((f) => Array(5).fill(f)));
+
+const experiment = createExperimentMachine({
+  id: 'flanker',
+  tasks,
+  trialMachine: flankerTrialMachine,
+});
+```
+
+Timeline variables become a plain array of task objects passed to the experiment machine. Randomization is done with standard JavaScript before the machine is created. The machine does not need special randomization support — it is just a statechart that iterates over an array.
+
+## Step-by-step porting guide
+
+<Aside type="tip">
+You do not need to port everything at once. Start with one trial type, get it working as a machine, then expand to the full experiment.
+</Aside>
+
+### Step 1: Identify your trial's states
+
+Every jsPsych plugin implicitly has states. Read through the plugin's `trial()` method and identify:
+
+- **Fixation / pre-stimulus** — what happens before the stimulus appears?
+- **Stimulus display** — what is shown and when?
+- **Response collection** — what inputs are accepted?
+- **Evaluation** — how is correctness determined?
+- **Feedback** — what is shown after the response?
+
+These become the states in your trial machine.
+
+### Step 2: Identify events
+
+What external inputs does your trial respond to?
+
+- Keyboard presses → `{ type: 'KEYPRESS', key, timestamp }`
+- Mouse clicks → `{ type: 'CLICK', x, y, timestamp }`
+- Canvas interactions → `{ type: 'CANVAS_CLICK', x, y, timestamp }`
+- Form submissions → `{ type: 'SUBMIT' }`
+- Grid submissions → `{ type: 'SUBMIT_GRID', grid }`
+
+### Step 3: Identify guards
+
+What conditions affect the trial flow?
+
+- Valid key filter → `validKey` guard
+- Correct response check → `isCorrect` guard
+- Retry limit → `canRetry` guard
+- Timeout → delayed transition (not a guard)
+
+### Step 4: Identify context
+
+What data does the trial accumulate?
+
+- Stimulus parameters (from input)
+- Response data (key, RT, coordinates)
+- Timing marks (stimulus onset, response time)
+- Correctness, accuracy
+- Attempt counter
+
+### Step 5: Write the machine
+
+Use the trial machine template from the [API Reference](/api/core/) and fill in your states, events, guards, and context.
+
+### Step 6: Test headlessly
+
+Write tests that create an actor, send events, and assert on state and output. Use `vi.useFakeTimers()` for timed transitions.
+
+### Step 7: Add rendering
+
+Subscribe to the actor's state changes and render the appropriate UI for each state. The rendering layer should be a pure function of the current snapshot.
+
+## Common patterns
+
+### `on_finish` callback → transition action
+
+```js
+// jsPsych
+on_finish: (data) => { data.correct = data.response === 'j'; }
+
+// jsPsych2
+KEYPRESS: {
+  target: 'done',
+  actions: assign(({ event }) => ({
+    correct: event.key === 'j',
+  })),
+}
+```
+
+### `trial_duration` → delayed transition
+
+```js
+// jsPsych
+{ trial_duration: 3000 }
+
+// jsPsych2
+stimulus: {
+  after: { 3000: 'done' },
+}
+```
+
+### `post_trial_gap` → feedback state with delay
+
+```js
+// jsPsych
+{ post_trial_gap: 500 }
+
+// jsPsych2
+feedback: {
+  after: { 500: 'done' },
+}
+```
+
+### Global data access → actor output
+
+```js
+// jsPsych
+const data = jsPsych.data.get().filter({ correct: true });
+
+// jsPsych2
+// Data is available from the experiment machine's context
+const snap = actor.getSnapshot();
+const correctTrials = snap.context.responses.filter(r => r.correct);
+```
+
+### Extensions → background actors
+
+```js
+// jsPsych extension (e.g., eye tracking)
+jsPsych.use(eyeTrackingExtension);
+
+// jsPsych2: background actor in parallel state
+invoke: {
+  id: 'eyeTracker',
+  src: eyeTrackingActor,
+}
+```
+
+## Further reading
+
+- [Your First Experiment](/guides/first-experiment/) — build a complete experiment from scratch
+- [API Reference: Core](/api/core/) — machine factory functions and utilities
+- [API Reference: Plugins](/api/plugins/) — pre-built trial machines for common paradigms

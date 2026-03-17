@@ -1,0 +1,234 @@
+---
+title: ARC Grid
+description: An Abstraction and Reasoning Corpus task demonstrating grid interaction, retry logic, and cell-by-cell evaluation.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Overview
+
+The ARC (Abstraction and Reasoning Corpus) grid task presents pattern-completion puzzles. The participant studies training examples that demonstrate a transformation rule, then applies that rule to a test input by painting a grid. This was the first prototype built with jsPsych2 and served as the proof-of-concept for the entire architecture.
+
+### What this demonstrates
+
+- **Multi-attempt retry logic** — up to 3 attempts per task, controlled by guards
+- **Grid evaluation** — cell-by-cell comparison with accuracy scoring
+- **Complex input/output** — 2D grids as machine context
+- **Training-then-test flow** — sequential states for instruction and response
+- **Inspect-based rendering** — UI updates driven by XState's inspect API
+
+## State diagram
+
+```
+[showTraining] ──START_TEST──> [testPresentation] ──BEGIN_RESPONSE──> [responseCollection]
+                                                                            |
+                                                                       SUBMIT_GRID
+                                                                            |
+                                                                            v
+                                                                      [evaluation]
+                                                                            |
+                                                                      entry: evaluate
+                                                                            |
+                                                                       always v
+                                                                       [feedback]
+                                                                            |
+                                                                 after 1500ms:
+                                                              ┌──────────┼──────────┐
+                                                              |          |          |
+                                                        guard:     guard:      (default)
+                                                       isCorrect  canRetry
+                                                              |          |          |
+                                                              v          v          v
+                                                           [done]  [response    [done]
+                                                                   Collection]
+```
+
+## Machine definition
+
+This machine uses `evaluateGrid` — a pure function that compares two 2D arrays cell by cell:
+
+```ts
+function evaluateGrid(submitted, expected) {
+  let total = 0;
+  let correctCells = 0;
+  for (let r = 0; r < expected.length; r++) {
+    for (let c = 0; c < expected[0].length; c++) {
+      total++;
+      if (submitted?.[r]?.[c] === expected[r][c]) correctCells++;
+    }
+  }
+  return {
+    correct: total === correctCells,
+    accuracy: total > 0 ? correctCells / total : 0,
+    totalCells: total,
+    correctCells,
+  };
+}
+```
+
+The trial machine:
+
+```ts
+import { setup, assign } from 'xstate';
+
+export const arcTrialMachine = setup({
+  actions: {
+    recordResponseStart: assign({
+      responseStartTime: () => performance.now(),
+    }),
+    recordSubmission: assign({
+      submittedGrid: ({ event }) => event.grid,
+      rt: ({ context }) =>
+        performance.now() - context.responseStartTime,
+    }),
+    evaluate: assign(({ context }) => {
+      const result = evaluateGrid(
+        context.submittedGrid,
+        context.task.test[0].output,
+      );
+      return {
+        correct: result.correct,
+        accuracy: result.accuracy,
+        attempt: context.attempt + 1,
+      };
+    }),
+  },
+  guards: {
+    isCorrect: ({ context }) => context.correct,
+    canRetry: ({ context }) =>
+      !context.correct && context.attempt < 3,
+  },
+}).createMachine({
+  id: 'arcTrial',
+  initial: 'showTraining',
+  context: ({ input }) => ({
+    task: input.task,
+    taskIndex: input.taskIndex,
+    attempt: 0,
+    submittedGrid: null,
+    rt: null,
+    responseStartTime: null,
+    correct: false,
+    accuracy: 0,
+  }),
+  states: {
+    showTraining: {
+      on: { START_TEST: 'testPresentation' },
+    },
+    testPresentation: {
+      on: { BEGIN_RESPONSE: 'responseCollection' },
+    },
+    responseCollection: {
+      entry: 'recordResponseStart',
+      on: {
+        SUBMIT_GRID: {
+          target: 'evaluation',
+          actions: 'recordSubmission',
+        },
+      },
+    },
+    evaluation: {
+      entry: 'evaluate',
+      always: 'feedback',
+    },
+    feedback: {
+      after: {
+        1500: [
+          { target: 'done', guard: 'isCorrect' },
+          { target: 'responseCollection', guard: 'canRetry' },
+          { target: 'done' }, // out of attempts
+        ],
+      },
+    },
+    done: { type: 'final' },
+  },
+  output: ({ context }) => ({
+    taskIndex: context.taskIndex,
+    correct: context.correct,
+    accuracy: context.accuracy,
+    attempts: context.attempt,
+    rt: context.rt,
+  }),
+});
+```
+
+## Experiment integration
+
+The ARC experiment machine invokes this trial machine for each task in the set:
+
+```ts
+import { createExperimentMachine } from '@xstate-experiments/core';
+import { arcTrialMachine } from './arc-trial';
+
+const tasks = await fetch('./tasks.json').then(r => r.json());
+
+const experiment = createExperimentMachine({
+  id: 'arcExperiment',
+  tasks,
+  trialMachine: arcTrialMachine,
+});
+```
+
+Each task object contains:
+- `name` — human-readable task name
+- `train` — array of `{ input: number[][], output: number[][] }` training pairs
+- `test` — array of `{ input: number[][], output: number[][] }` test cases
+
+## Rendering the grid
+
+The grid renderer is a separate module that subscribes to machine state:
+
+```ts
+// When state is 'responseCollection', render an editable grid:
+const editableGrid = renderGrid(container, startGrid, {
+  editable: true,
+  selectedColor: () => colorPicker.getColor(),
+});
+
+// The grid supports click-and-drag painting via event delegation.
+// When the participant submits:
+document.getElementById('submit').onclick = () => {
+  const grid = editableGrid.getGrid();
+  trialActor.send({ type: 'SUBMIT_GRID', grid });
+};
+```
+
+The rendering layer does not manage any experiment state. It reads the current snapshot, renders the appropriate UI, and forwards user actions as events. The machine handles all logic.
+
+<Aside type="note">
+The original ARC prototype uses vanilla DOM rendering (no framework). The grid is built from `div` elements with CSS classes for colors. This zero-dependency approach keeps the rendering layer simple and shows that jsPsych2 does not require any specific UI framework.
+</Aside>
+
+## Key design decisions
+
+**Retry loop through states.** When the participant gets a wrong answer and has attempts remaining, the feedback state transitions back to `responseCollection`. This creates a visible loop in the statechart that directly expresses the retry logic. On retry, the previous submission is available in context so the grid can be pre-populated.
+
+**Evaluation as a transient state.** The `evaluation` state runs its entry action (`evaluate`) and immediately transitions to `feedback` via an `always` transition. It exists as a separate state so the evaluation logic is visible in the statechart, even though the participant never "sees" it.
+
+**Cell-by-cell accuracy.** The `evaluateGrid` function returns both a boolean `correct` (all cells match) and a numeric `accuracy` (fraction of cells correct). This gives the participant meaningful feedback even when the answer is wrong.
+
+## Console debugging
+
+The experiment actor is exposed on `window.__experimentActor` for console debugging:
+
+```js
+// Get current state
+__experimentActor.getSnapshot().value
+
+// Get trial actor
+__experimentActor.getSnapshot().children.currentTrial
+
+// Get trial state
+__experimentActor.getSnapshot().children.currentTrial?.getSnapshot()
+
+// Send events manually
+__experimentActor.getSnapshot().children.currentTrial?.send({
+  type: 'START_TEST'
+})
+```
+
+## Links
+
+- [Full source](https://github.com/xstate-experiments/jsPsych2/tree/main/examples/arc-grid)
+- [ARC dataset](https://github.com/fchollet/ARC-AGI) — the original Abstraction and Reasoning Corpus
+- [Stately Visualizer](https://stately.ai/viz) — paste the machine definition to explore
