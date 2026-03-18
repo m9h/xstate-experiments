@@ -3,6 +3,7 @@ import starlight from '@astrojs/starlight';
 
 export default defineConfig({
   site: 'https://xstate-experiments.github.io',
+  base: '/jsPsych2',
   integrations: [
     starlight({
       title: 'jsPsych2',
